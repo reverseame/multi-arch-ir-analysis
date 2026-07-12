@@ -1,0 +1,12 @@
+# Python virtual environment
+IRanalysis/
+old_poc/
+__pycache__/
+*.pyc
+
+# Pipeline output
+results/
+
+# Ghidra per-run project state left inside results/ (also covered by results/, kept for clarity)
+*.rep/
+*.gpr

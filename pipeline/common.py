@@ -150,10 +150,13 @@ def write_whole_binary_dump(outdir, filename, chunks):
 def write_summary(outdir, backend, binary, num_functions, lifted_records, duration_s, fatal_error=None):
     """Write summary.json for a backend run and return the summary dict.
 
-    lifted_records: list of {"function", "address", "status", "error", "output_file"}
+    lifted_records: list of {"function", "address", "status", "error", "output_file"}.
+    status is "ok", "error", or "skipped" (e.g. external/library functions that
+    were never expected to be lifted -- not counted as errors).
     """
     num_ok = sum(1 for r in lifted_records if r["status"] == "ok")
     num_error = sum(1 for r in lifted_records if r["status"] == "error")
+    num_skipped = sum(1 for r in lifted_records if r["status"] == "skipped")
     summary = {
         "backend": backend,
         "binary": str(binary),
@@ -161,6 +164,7 @@ def write_summary(outdir, backend, binary, num_functions, lifted_records, durati
         "num_functions": num_functions,
         "num_lifted_ok": num_ok,
         "num_lifted_error": num_error,
+        "num_lifted_skipped": num_skipped,
         "duration_s": duration_s,
         "fatal_error": fatal_error,
     }

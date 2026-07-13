@@ -38,6 +38,7 @@ def list_functions(cfg):
                 name=func.name,
                 address=func.addr,
                 size=func.size,
+                external=bool(func.is_simprocedure),
                 extra={"num_blocks": len(list(func.blocks))},
             )
         )
@@ -92,6 +93,13 @@ def run(binary_path, outdir, limit):
                 if func.addr not in target_addrs:
                     continue
                 record = {"function": func.name, "address": hex(func.addr)}
+
+                if func.is_simprocedure:
+                    record["status"] = "skipped"
+                    record["reason"] = "external/simprocedure function, not lifted"
+                    lifted_records.append(record)
+                    continue
+
                 try:
                     out_path, n_stmts, text = lift_function(proj, func, ir_dir)
                     record["status"] = "ok"
@@ -110,7 +118,7 @@ def run(binary_path, outdir, limit):
     summary = write_summary(outdir, "angr_vex", binary_path, len(functions), lifted_records, timer.duration_s, fatal_error)
     write_json(outdir / "lift_records.json", lifted_records)
 
-    print(f"Functions: {len(functions)}  ok={summary['num_lifted_ok']}  errors={summary['num_lifted_error']}")
+    print(f"Functions: {len(functions)}  ok={summary['num_lifted_ok']}  errors={summary['num_lifted_error']}  skipped={summary['num_lifted_skipped']}")
     print(f"Duration: {timer.duration_s:.2f}s")
     return 0 if fatal_error is None else 1
 

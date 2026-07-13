@@ -67,8 +67,26 @@ def pcodeop_high_str(op, language):
     return f"{mnemonic} {inputs_str}"
 
 
+def is_external_placeholder(func, memory):
+    """True for functions with no real code to decompile: genuinely external
+    functions, and Ghidra's synthetic placeholders for unresolved import
+    targets (parked in a memory block literally named "EXTERNAL" since no
+    library is loaded to back them).
+
+    A real .plt trampoline is also isThunk() (it thunks to that placeholder)
+    but has actual instruction bytes in the binary's own .plt section, so
+    isThunk() alone would wrongly also skip those -- check block membership
+    instead of relying on isThunk().
+    """
+    if func.isExternal():
+        return True
+    block = memory.getBlock(func.getEntryPoint())
+    return block is not None and block.getName() == "EXTERNAL"
+
+
 def list_functions(program):
     func_manager = program.getFunctionManager()
+    memory = program.getMemory()
     functions = []
     for func in func_manager.getFunctions(True):
         functions.append(
@@ -76,7 +94,7 @@ def list_functions(program):
                 name=func.getName(),
                 address=str(func.getEntryPoint()),
                 size=int(func.getBody().getNumAddresses()),
-                external=bool(func.isExternal()),
+                external=bool(is_external_placeholder(func, memory)),
                 thunk=bool(func.isThunk()),
             )
         )
@@ -166,15 +184,16 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                     ifc = DecompInterface()
                     ifc.setOptions(DecompileOptions())
                     ifc.openProgram(program)
+                    memory = program.getMemory()
                     try:
                         for func in func_manager.getFunctions(True):
                             if str(func.getEntryPoint()) not in target_addrs:
                                 continue
                             record = {"function": func.getName(), "address": str(func.getEntryPoint())}
 
-                            if func.isExternal() or func.isThunk():
-                                record["status"] = "error"
-                                record["error"] = "external/thunk function, not decompiled"
+                            if is_external_placeholder(func, memory):
+                                record["status"] = "skipped"
+                                record["reason"] = "external function, not decompiled"
                                 lifted_records.append(record)
                                 continue
 
@@ -201,7 +220,7 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
     summary = write_summary(outdir, "pyghidra_highpcode", binary_path, len(functions), lifted_records, timer.duration_s, fatal_error)
     write_json(outdir / "lift_records.json", lifted_records)
 
-    print(f"Functions: {len(functions)}  ok={summary['num_lifted_ok']}  errors={summary['num_lifted_error']}")
+    print(f"Functions: {len(functions)}  ok={summary['num_lifted_ok']}  errors={summary['num_lifted_error']}  skipped={summary['num_lifted_skipped']}")
     print(f"Duration: {timer.duration_s:.2f}s")
     return 0 if fatal_error is None else 1
 

@@ -21,11 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pipeline.common import (  
+from pipeline.common import (
     Timer,
     build_backend_arg_parser,
     make_function_entry,
-    safe_filename,
     write_json,
     write_summary,
     write_whole_binary_dump,
@@ -101,7 +100,7 @@ def list_functions(program):
     return functions
 
 
-def lift_function(ifc, func, language, ir_dir, monitor, timeout_s):
+def lift_function(ifc, func, language, monitor, timeout_s):
     result = ifc.decompileFunction(func, timeout_s, monitor)
     if not result.decompileCompleted():
         msg = result.getErrorMessage() or "timeout/cancelled"
@@ -125,16 +124,10 @@ def lift_function(ifc, func, language, ir_dir, monitor, timeout_s):
         total_ops += 1
 
     text = "\n".join(lines)
-    out_name = f"{safe_filename(func.getName())}_{func.getEntryPoint()}.txt".replace(":", "_")
-    out_path = ir_dir / out_name
-    out_path.write_text(text)
-    return out_path, total_ops, text
+    return total_ops, text
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
-    ir_dir = outdir / "ir"
-    ir_dir.mkdir(parents=True, exist_ok=True)
-
     project_dir = outdir / "ghidra_project"
     project_dir.mkdir(parents=True, exist_ok=True)
     project_name = "lift"
@@ -198,9 +191,8 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                out_path, n_ops, text = lift_function(ifc, func, language, ir_dir, monitor, decomp_timeout_s)
+                                n_ops, text = lift_function(ifc, func, language, monitor, decomp_timeout_s)
                                 record["status"] = "ok"
-                                record["output_file"] = str(out_path.relative_to(outdir))
                                 record["num_pcode_ops"] = n_ops
                                 whole_binary_chunks.append((int(func.getEntryPoint().getOffset()), text))
                             except (JavaException, Exception) as e:

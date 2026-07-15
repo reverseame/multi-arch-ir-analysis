@@ -16,7 +16,6 @@ from pipeline.common import (
     Timer,
     build_backend_arg_parser,
     make_function_entry,
-    safe_filename,
     write_json,
     write_summary,
     write_whole_binary_dump,
@@ -38,7 +37,7 @@ def list_functions(bv):
     return functions
 
 
-def lift_function(func, ir_dir):
+def lift_function(func):
     hlil = func.hlil
     lines = [f"; ---- function {func.name} @ {hex(func.start)} ----"]
     num_instructions = 0
@@ -46,16 +45,10 @@ def lift_function(func, ir_dir):
         lines.append(f"  0x{insn.address:x}  {insn}")
         num_instructions += 1
     text = "\n".join(lines)
-    out_name = f"{safe_filename(func.name)}_{hex(func.start)}.txt"
-    out_path = ir_dir / out_name
-    out_path.write_text(text)
-    return out_path, num_instructions, text
+    return num_instructions, text
 
 
 def run(binary_path, outdir, limit):
-    ir_dir = outdir / "ir"
-    ir_dir.mkdir(parents=True, exist_ok=True)
-
     fatal_error = None
     functions = []
     lifted_records = []
@@ -81,9 +74,8 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        out_path, n_instr, text = lift_function(func, ir_dir)
+                        n_instr, text = lift_function(func)
                         record["status"] = "ok"
-                        record["output_file"] = str(out_path.relative_to(outdir))
                         record["num_hlil_instructions"] = n_instr
                         whole_binary_chunks.append((func.start, text))
                     except Exception as e:

@@ -2,9 +2,9 @@
 
 Each backend script (pipeline/backends/*_lift.py) is a standalone CLI tool
 that takes a --binary and --outdir, lists the binary's functions, lifts them
-to that backend's IR, and writes functions.json / summary.json / ir/*.txt
-under --outdir. This module holds the pieces that are identical across
-backends.
+to that backend's IR, and writes functions.json / summary.json /
+whole_binary.<level>.txt under --outdir. This module holds the pieces that
+are identical across backends.
 """
 
 import argparse
@@ -85,16 +85,6 @@ def write_json(path, obj):
         json.dump(obj, f, indent=2)
 
 
-_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
-
-
-def safe_filename(name):
-    """Turn a function name into something safe to use as a filename.
-    Tool-reported names can contain '.', '@', '::', etc. (e.g. sym.imp.puts).
-    """
-    return _UNSAFE_FILENAME_RE.sub("_", name).strip("_") or "unnamed"
-
-
 def make_function_entry(name, address, size=None, external=None, thunk=None, extra=None):
     """Normalize a function record to a common schema across backends.
     address may be an int or a string; always stored as a hex string.
@@ -129,7 +119,7 @@ class Timer:
 def build_backend_arg_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--binary", required=True, type=Path, help="Path to the ELF binary to lift")
-    parser.add_argument("--outdir", required=True, type=Path, help="Directory to write functions.json/summary.json/ir/*")
+    parser.add_argument("--outdir", required=True, type=Path, help="Directory to write functions.json/summary.json/whole_binary.<level>.txt")
     parser.add_argument("--limit", type=int, default=None, help="Only lift the first N functions (debugging/smoke tests)")
     return parser
 
@@ -150,7 +140,7 @@ def write_whole_binary_dump(outdir, filename, chunks):
 def write_summary(outdir, backend, binary, num_functions, lifted_records, duration_s, fatal_error=None):
     """Write summary.json for a backend run and return the summary dict.
 
-    lifted_records: list of {"function", "address", "status", "error", "output_file"}.
+    lifted_records: list of {"function", "address", "status", "error"}.
     status is "ok", "error", or "skipped" (e.g. external/library functions that
     were never expected to be lifted -- not counted as errors).
     """

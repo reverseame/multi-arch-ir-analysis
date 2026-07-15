@@ -16,11 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pipeline.common import (  
+from pipeline.common import (
     Timer,
     build_backend_arg_parser,
     make_function_entry,
-    safe_filename,
     write_json,
     write_summary,
     write_whole_binary_dump,
@@ -45,7 +44,7 @@ def list_functions(cfg):
     return functions
 
 
-def lift_function(proj, func, ir_dir):
+def lift_function(proj, func):
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
     for block in func.blocks:
@@ -59,16 +58,10 @@ def lift_function(proj, func, ir_dir):
         total_statements += len(irsb.statements)
 
     text = "\n".join(lines)
-    out_name = f"{safe_filename(func.name)}_{hex(func.addr)}.txt"
-    out_path = ir_dir / out_name
-    out_path.write_text(text)
-    return out_path, total_statements, text
+    return total_statements, text
 
 
 def run(binary_path, outdir, limit):
-    ir_dir = outdir / "ir"
-    ir_dir.mkdir(parents=True, exist_ok=True)
-
     fatal_error = None
     functions = []
     lifted_records = []
@@ -101,9 +94,8 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    out_path, n_stmts, text = lift_function(proj, func, ir_dir)
+                    n_stmts, text = lift_function(proj, func)
                     record["status"] = "ok"
-                    record["output_file"] = str(out_path.relative_to(outdir))
                     record["num_statements"] = n_stmts
                     whole_binary_chunks.append((func.addr, text))
                 except Exception as e:

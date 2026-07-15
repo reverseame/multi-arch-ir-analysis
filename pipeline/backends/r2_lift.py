@@ -12,11 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pipeline.common import (  
+from pipeline.common import (
     Timer,
     build_backend_arg_parser,
     make_function_entry,
-    safe_filename,
     write_json,
     write_summary,
     write_whole_binary_dump,
@@ -45,7 +44,7 @@ def list_functions(r2):
     return functions
 
 
-def lift_function(r2, addr, ir_dir, func_name):
+def lift_function(r2, addr, func_name):
     data = r2.cmdj(f"pdfj @ {addr}")
     if not data or "ops" not in data:
         raise RuntimeError("pdfj returned no ops")
@@ -64,16 +63,10 @@ def lift_function(r2, addr, ir_dir, func_name):
         lines.append("")
 
     text = "\n".join(lines)
-    out_name = f"{safe_filename(func_name)}_{hex(addr)}.txt"
-    out_path = ir_dir / out_name
-    out_path.write_text(text)
-    return out_path, len(ops), num_uncovered, text
+    return len(ops), num_uncovered, text
 
 
 def run(binary_path, outdir, limit):
-    ir_dir = outdir / "ir"
-    ir_dir.mkdir(parents=True, exist_ok=True)
-
     fatal_error = None
     functions = []
     lifted_records = []
@@ -98,9 +91,8 @@ def run(binary_path, outdir, limit):
                     addr = int(func["address"], 16)
                     record = {"function": func["name"], "address": func["address"]}
                     try:
-                        out_path, n_ops, n_uncovered, text = lift_function(r2, addr, ir_dir, func["name"])
+                        n_ops, n_uncovered, text = lift_function(r2, addr, func["name"])
                         record["status"] = "ok"
-                        record["output_file"] = str(out_path.relative_to(outdir))
                         record["num_instructions"] = n_ops
                         record["num_uncovered"] = n_uncovered
                         whole_binary_chunks.append((addr, text))

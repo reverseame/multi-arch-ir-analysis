@@ -4,7 +4,9 @@ RetDec has no Python API: it's invoked as a subprocess that decompiles the
 whole binary in one pass, producing (among others) a .dsm disassembly listing
 and a .ll LLVM IR module. This script runs that pass once, then:
   - parses functions.json out of the .dsm "; function: NAME at START -- END" lines
-  - splits the .ll module into one file per function under ir/
+  - scans the .ll module to record each function's line count (the module
+    itself is copied whole to whole_binary.ll; per-function IR isn't split
+    out separately since that content is already in the whole-binary dump)
 
 Standalone CLI:
     python -m pipeline.backends.retdec_lift --binary <path> --outdir <dir> \
@@ -24,11 +26,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pipeline.common import (  
+from pipeline.common import (
     Timer,
     build_backend_arg_parser,
     make_function_entry,
-    safe_filename,
     write_json,
     write_summary,
 )
@@ -69,14 +70,14 @@ def list_functions_from_dsm(dsm_path):
     return functions
 
 
-def split_ll_by_function(ll_path, ir_dir):
-    """Split a .ll module into one file per top-level `define` block, using
-    brace depth to find each function's end (RetDec doesn't nest functions,
-    but a naive line-range split without brace tracking would break on
-    functions containing nested `{`/`}` in literals).
+def split_ll_by_function(ll_path):
+    """Walk a .ll module's top-level `define` blocks, using brace depth to
+    find each function's end (RetDec doesn't nest functions, but a naive
+    line-range split without brace tracking would break on functions
+    containing nested `{`/`}` in literals), and record each one's line count.
     """
     lines = Path(ll_path).read_text(errors="replace").splitlines()
-    records = {}  # name -> (output_path, num_lines)
+    records = {}  # name -> num_lines
 
     i = 0
     while i < len(lines):
@@ -93,18 +94,12 @@ def split_ll_by_function(ll_path, ir_dir):
             j += 1
             if depth == 0 and j > start:
                 break
-        block = lines[start:j]
-        out_path = ir_dir / f"{safe_filename(name)}.ll"
-        out_path.write_text("\n".join(block))
-        records[name] = (out_path, len(block))
+        records[name] = j - start
         i = j
     return records
 
 
 def run(binary_path, outdir, limit, retdec_bin, timeout_s):
-    ir_dir = outdir / "ir"
-    ir_dir.mkdir(parents=True, exist_ok=True)
-
     fatal_error = None
     functions = []
     lifted_records = []
@@ -148,20 +143,18 @@ def run(binary_path, outdir, limit, retdec_bin, timeout_s):
                 "functions": functions,
             })
 
-            ll_functions = split_ll_by_function(ll_path, ir_dir)
+            ll_functions = split_ll_by_function(ll_path)
             shutil.copyfile(ll_path, outdir / "whole_binary.ll")
 
             target = functions if limit is None else functions[:limit]
             for func in target:
                 record = {"function": func["name"], "address": func["address"]}
-                hit = ll_functions.get(func["name"])
-                if hit is None:
+                n_lines = ll_functions.get(func["name"])
+                if n_lines is None:
                     record["status"] = "error"
                     record["error"] = "no LLVM IR definition found (likely external/pruned by RetDec)"
                 else:
-                    out_path, n_lines = hit
                     record["status"] = "ok"
-                    record["output_file"] = str(out_path.relative_to(outdir))
                     record["num_ll_lines"] = n_lines
                 lifted_records.append(record)
         except Exception as e:

@@ -55,9 +55,6 @@ def run_one(python_exe, backend, module, binary, outdir, limit, timeout_s, retde
     if backend == "retdec" and retdec_bin:
         cmd += ["--retdec-bin", str(retdec_bin)]
 
-    print(f"\n=== {binary.name} :: {backend} ===")
-    print(" ".join(cmd))
-
     t0 = time.perf_counter()
     record = {"binary": str(binary), "backend": backend, "outdir": str(outdir)}
     try:
@@ -69,20 +66,22 @@ def run_one(python_exe, backend, module, binary, outdir, limit, timeout_s, retde
         if proc.returncode != 0:
             (outdir / "orchestrator_stdout.log").write_text(proc.stdout)
             (outdir / "orchestrator_stderr.log").write_text(proc.stderr)
-            print(f"  FAILED (exit {proc.returncode}) -- see {outdir}/orchestrator_stderr.log")
-        else:
-            print("  ok")
     except subprocess.TimeoutExpired:
         record["status"] = "timeout"
         record["returncode"] = None
-        print(f"  TIMEOUT after {timeout_s}s")
     except Exception as e:
         record["status"] = "crashed"
         record["returncode"] = None
         record["error"] = f"{type(e).__name__}: {e}"
-        print(f"  CRASHED: {record['error']}")
 
     record["wall_time_s"] = time.perf_counter() - t0
+
+    if record["status"] == "ok":
+        print(f"  {backend:<12} OK")
+    elif record["status"] == "failed":
+        print(f"  {backend:<12} ERROR -- see {outdir}/orchestrator_stderr.log")
+    else:
+        print(f"  {backend:<12} ERROR ({record['status']})")
 
     summary_path = outdir / "summary.json"
     if summary_path.exists():
@@ -165,6 +164,7 @@ def main():
         binary_dir = args.results_dir / binary.stem
         write_json(binary_dir / "metadata.json", meta)
 
+        print(f"\n{binary.name}")
         for backend in backends:
             module = BACKENDS[backend]
             outdir = binary_dir / backend

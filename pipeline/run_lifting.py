@@ -64,11 +64,11 @@ def run_one(python_exe, backend, module, binary, outdir, limit, timeout_s, retde
         proc = subprocess.run(
             cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=timeout_s
         )
-        (outdir / "orchestrator_stdout.log").write_text(proc.stdout)
-        (outdir / "orchestrator_stderr.log").write_text(proc.stderr)
         record["returncode"] = proc.returncode
         record["status"] = "ok" if proc.returncode == 0 else "failed"
         if proc.returncode != 0:
+            (outdir / "orchestrator_stdout.log").write_text(proc.stdout)
+            (outdir / "orchestrator_stderr.log").write_text(proc.stderr)
             print(f"  FAILED (exit {proc.returncode}) -- see {outdir}/orchestrator_stderr.log")
         else:
             print("  ok")

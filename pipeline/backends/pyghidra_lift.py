@@ -100,7 +100,7 @@ def list_functions(program):
     return functions
 
 
-def lift_function(ifc, func, language, monitor, timeout_s):
+def lift_function(ifc, func, language, monitor, timeout_s, listing):
     result = ifc.decompileFunction(func, timeout_s, monitor)
     if not result.decompileCompleted():
         msg = result.getErrorMessage() or "timeout/cancelled"
@@ -123,8 +123,12 @@ def lift_function(ifc, func, language, monitor, timeout_s):
         lines.append(f"  {pcodeop_high_str(op, language)}")
         total_ops += 1
 
+    # Native disassembly instruction count over the function's own address
+    # range for obtaining expansion ratio.
+    num_native_instructions = sum(1 for _ in listing.getInstructions(func.getBody(), True))
+
     text = "\n".join(lines)
-    return total_ops, text
+    return total_ops, num_native_instructions, text
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -178,6 +182,7 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                     ifc.setOptions(DecompileOptions())
                     ifc.openProgram(program)
                     memory = program.getMemory()
+                    listing = program.getListing()
                     try:
                         for func in func_manager.getFunctions(True):
                             if str(func.getEntryPoint()) not in target_addrs:
@@ -191,9 +196,10 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, text = lift_function(ifc, func, language, monitor, decomp_timeout_s)
+                                n_ops, n_native, text = lift_function(ifc, func, language, monitor, decomp_timeout_s, listing)
                                 record["status"] = "ok"
                                 record["num_pcode_ops"] = n_ops
+                                record["num_native_instructions"] = n_native
                                 whole_binary_chunks.append((int(func.getEntryPoint().getOffset()), text))
                             except (JavaException, Exception) as e:
                                 record["status"] = "error"

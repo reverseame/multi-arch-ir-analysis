@@ -45,7 +45,9 @@ def lift_function(func):
         lines.append(f"  0x{insn.address:x}  {insn}")
         num_instructions += 1
     text = "\n".join(lines)
-    return num_instructions, text
+    # func.instructions for expansion ratio.
+    num_native_instructions = sum(1 for _ in func.instructions)
+    return num_instructions, num_native_instructions, text
 
 
 def run(binary_path, outdir, limit):
@@ -74,9 +76,10 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, text = lift_function(func)
+                        n_instr, n_native, text = lift_function(func)
                         record["status"] = "ok"
                         record["num_llil_instructions"] = n_instr
+                        record["num_native_instructions"] = n_native
                         whole_binary_chunks.append((func.start, text))
                     except Exception as e:
                         record["status"] = "error"

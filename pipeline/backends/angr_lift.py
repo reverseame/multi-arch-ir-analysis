@@ -47,6 +47,7 @@ def list_functions(cfg):
 def lift_function(proj, func):
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
+    total_native_instructions = 0
     for block in func.blocks:
         data = proj.loader.memory.load(block.addr, block.size)
         irsb = pyvex.lift(data, block.addr, proj.arch)
@@ -56,9 +57,11 @@ def lift_function(proj, func):
         lines.append(f"  NEXT: {irsb.next} ; jumpkind={irsb.jumpkind}")
         lines.append("")
         total_statements += len(irsb.statements)
+        # block.instructions for expansion ratio
+        total_native_instructions += block.instructions
 
     text = "\n".join(lines)
-    return total_statements, text
+    return total_statements, total_native_instructions, text
 
 
 def run(binary_path, outdir, limit):
@@ -94,9 +97,10 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_stmts, text = lift_function(proj, func)
+                    n_stmts, n_native, text = lift_function(proj, func)
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
+                    record["num_native_instructions"] = n_native
                     whole_binary_chunks.append((func.addr, text))
                 except Exception as e:
                     record["status"] = "error"

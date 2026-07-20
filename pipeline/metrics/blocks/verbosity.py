@@ -1,45 +1,59 @@
-"""Verbosity metrics block: IR-size expansion ratio, per (binary, backend, function).
+"""Verbosity metrics block: IR-size expansion ratio, per (binary, backend,
+function), classified by native-instruction type -- arithmetic, control, or
+memory -- from possible_metrics.txt's "IR-size expansion ratio":
+expansion_ratio_{arithmetic,control,memory} = (IR ops of that category) /
+(native instructions of that category), within one function. No cross-backend
+function matching is needed: the comparison is IR size vs. native size
+*within* the same backend's own run, unlike the cross-architecture invariance
+metrics in binja_invariance.py.
 
-expansion_ratio_ops: (IR op count) / (native instruction count), from
-possible_metrics.txt's "IR-size expansion ratio" -- the operations variant
-(IR ops, not lines). No cross-backend function matching is needed: the
-comparison is IR size vs. native size *within* the same backend's own run,
-unlike the cross-architecture invariance metrics in binja_invariance.py.
+Both sides of the ratio are classified by the same rule for a given category
+(see pipeline/native_classify.py for the native side; each backend module's
+own IR-op classifier for the numerator -- angr_lift.classify_vex_statement,
+binja_il_classify.classify_il_operation, pyghidra_lift.classify_pcode_op,
+r2_lift.classify_esil_expression, and this module's classify_ll_line for
+retdec's LLVM IR). "other" (data movement, casts, SSA bookkeeping, NOPs) is
+computed too but not reported as a ratio -- see each classifier's own
+docstring for why it's excluded (mainly: type conversions/reinterprets are
+deliberately not counted as "arithmetic" everywhere, consistently).
 
-The native instruction count comes from two different places depending on
+Per-function category counts come from two different places depending on
 the backend:
-  - angr/binja/pyghidra record it themselves, in lift_records.json (see
-    NATIVE_FIELD), because computing it needs their own already-open
-    session (loaded VEX blocks, an open Binary Ninja database, an open
-    Ghidra program) -- getting it later here would mean reloading the whole
-    binary in that tool, far more expensive than the near-free count taken
-    while the session is already open for lifting.
-  - retdec's is parsed here instead, straight from the .dsm disassembly
-    listing retdec_lift.py already leaves on disk under the run's outdir
-    (see _retdec_native_instruction_counts). Unlike the tools above, RetDec
-    has no live session to reuse -- the .dsm is a static text artifact --
-    so parsing it can happen at metrics time (not timed as lifting cost)
-    instead of adding a second pass inside retdec_lift.py's Timer()-wrapped
-    run.
+  - angr/binja/pyghidra/r2 record them directly in lift_records.json (the
+    ir_ops_{category}/native_{category} fields each backend's lift_function
+    now produces), because computing the native side needs their own
+    already-open session (loaded VEX blocks, an open Binary Ninja database,
+    an open Ghidra program, a live r2 session) -- getting it later here
+    would mean reloading the whole binary in that tool, far more expensive
+    than the near-free count taken while the session is already open for
+    lifting.
+  - retdec's are computed here instead, straight from the .dsm disassembly
+    listing and .ll LLVM IR module retdec_lift.py already leaves on disk
+    under the run's outdir (see _retdec_native_category_counts and
+    _retdec_ir_category_counts). Unlike the tools above, RetDec has no live
+    session to reuse -- both files are static text artifacts -- so parsing
+    them can happen at metrics time (not timed as lifting cost) instead of
+    adding a second pass inside retdec_lift.py's Timer()-wrapped run.
 
-RetDec's IR_SIZE_FIELDS entry (num_ll_lines) is LLVM-IR line count, not an op
-count -- possible_metrics.txt allows either for this metric ("IR ops or
-lines"), so it's included, just not directly comparable in magnitude to the
-op-counting backends.
-
-r2/ESIL's numerator (num_esil_ops) counts only real ESIL *operator* tokens
-per instruction (see r2_lift.py's esil_op_count), against radare2's own
-`ae???` operator table -- not every comma-separated token, since roughly
-half of them are operand values (registers, immediates) pushed onto ESIL's
-RPN stack rather than operations. This is the closest analog to a
+r2/ESIL's numerator counts only real ESIL *operator* tokens per instruction
+(see r2_lift.classify_esil_expression), against radare2's own `ae???`
+operator table -- not every comma-separated token, since roughly half of
+them are operand values (registers, immediates) pushed onto ESIL's RPN
+stack rather than operations. This is the closest analog to a
 sub-instruction op count that a flat, stack-based IR like ESIL has, but
 it's still a rougher proxy than the other backends' real per-op counts (VEX
-statements, P-code ops, IL instructions), so treat r2's ratio as
-lower-confidence/directional rather than directly comparable to the rest.
+statements, P-code ops, IL instructions), so treat r2's ratios as
+lower-confidence/directional rather than directly comparable to the rest --
+particularly its control ratio, which runs structurally higher on MIPS
+(delay-slot branches wrap every jump in fixed "?{"/"}"/BREAK/SETJT/SETD
+boilerplate that x86/ARM don't have) -- a real property of ESIL's own
+representation, not a classification bug.
 
 Only successful runs ("status" == "ok") are counted, and within a run, only
 per-function lift records with "status" == "ok" and a non-zero native
-instruction count (stub/empty functions can't produce a meaningful ratio).
+instruction count for that category (stub/empty functions, or functions
+with no instructions of a given category, can't produce a meaningful ratio
+for it).
 """
 
 import json
@@ -47,9 +61,19 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+from pipeline.backends.retdec_lift import DSM_FUNCTION_RE, LL_DEFINE_RE
 from pipeline.metrics.formulas import aggregate_stats, expansion_ratio
 from pipeline.metrics.registry import register_block
+from pipeline.native_classify import arch_family, classify_bytes, make_disassembler
 
+CATEGORIES = ("arithmetic", "control", "memory", "other")
+RATIO_CATEGORIES = ("arithmetic", "control", "memory")
+
+# Backends whose lift_records.json already carries per-category
+# ir_ops_{category}/native_{category} fields (see each backend module).
+# retdec is deliberately excluded -- classified here instead (see module
+# docstring) -- and "ir_size" still comes from its own field per backend,
+# purely for the informational (non-ratio) column in rows/CSV.
 IR_SIZE_FIELDS = {
     "binja_llil": "num_llil_instructions",
     "binja_mlil": "num_mlil_instructions",
@@ -60,14 +84,57 @@ IR_SIZE_FIELDS = {
     "r2": "num_esil_ops",
 }
 
-NATIVE_FIELD = "num_native_instructions"
-
-DSM_FUNCTION_RE = re.compile(r"^; function: (?P<name>\S+) at (?P<start>0x[0-9a-fA-F]+) -- (?P<end>0x[0-9a-fA-F]+)")
-DSM_INSTRUCTION_ADDR_RE = re.compile(r"^0x([0-9a-fA-F]+):")
+DSM_INSTRUCTION_RE = re.compile(r"^0x(?P<addr>[0-9a-fA-F]+):\s+(?P<bytes>[0-9a-fA-F ]+?)\s*\t")
 
 METRICS = {
-    "expansion_ratio_ops": {"direction": "descriptive", "unit": "ir_ops_or_lines / native_instr"},
+    f"expansion_ratio_{cat}": {"direction": "descriptive", "unit": "ir_ops / native_instr"}
+    for cat in RATIO_CATEGORIES
 }
+
+# LLVM IR opcode -> category, keyed off the same three buckets every other
+# backend's IR classifier uses (see module docstring). Type-conversion/cast
+# opcodes (trunc, zext, sext, bitcast, ...) and SSA bookkeeping (phi) are
+# deliberately left uncategorized ("other"), the same call made for VEX's
+# Iop_*to* ops and P-code's INT_ZEXT/INT_SEXT/CAST -- consistent across
+# every backend rather than just this one. getelementptr (pointer/index
+# address arithmetic, never itself a memory access) is "arithmetic",
+# matching this project's native-instruction classifier treating x86 `lea`
+# the same way.
+_LL_CONTROL = {"br", "switch", "ret", "call", "invoke", "callbr", "indirectbr", "unreachable", "resume"}
+_LL_MEMORY = {"load", "store", "alloca", "cmpxchg", "atomicrmw", "fence"}
+_LL_ARITHMETIC = {
+    "add", "fadd", "sub", "fsub", "mul", "fmul", "udiv", "sdiv", "fdiv",
+    "urem", "srem", "frem", "shl", "lshr", "ashr", "and", "or", "xor",
+    "icmp", "fcmp", "getelementptr",
+}
+_LL_CALL_MARKERS = {"tail", "musttail", "notail"}
+
+
+def classify_ll_line(line):
+    """One line of RetDec's LLVM-IR text output -> "arithmetic"/"control"/
+    "memory"/"other". Handles both instruction forms LLVM IR text uses:
+    "%N = OPCODE ..." (value-producing) and a bare "OPCODE ..." (void, e.g.
+    store/br/ret) -- labels, comments, blank lines, and directives
+    (uselistorder, metadata) don't start with any recognized opcode token
+    and fall to "other" with no special-casing needed.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return "other"
+    rhs = stripped.split("=", 1)[1].strip() if "=" in stripped else stripped
+    tokens = rhs.split()
+    if not tokens:
+        return "other"
+    opcode = tokens[0]
+    if opcode in _LL_CALL_MARKERS and len(tokens) > 1:
+        opcode = tokens[1]
+    if opcode in _LL_CONTROL:
+        return "control"
+    if opcode in _LL_MEMORY:
+        return "memory"
+    if opcode in _LL_ARITHMETIC:
+        return "arithmetic"
+    return "other"
 
 
 def _load_lift_records(outdir):
@@ -80,25 +147,28 @@ def _load_lift_records(outdir):
         return []
 
 
-def _retdec_native_instruction_counts(outdir, binary_path):
-    """name -> native instruction count, by counting "0xADDR: <bytes> <mnem>"
-    lines whose address falls inside the current function's own [start, end)
-    range from its "; function: NAME at START -- END" header (same regex
-    retdec_lift.py's own list_functions_from_dsm uses).
+def _empty_counts():
+    return {c: 0 for c in CATEGORIES}
 
-    Deliberately NOT "count instructions up to the next function header":
-    the .dsm ends with a "Data Segment" section that reuses the exact same
-    "0xADDR: <bytes> ..." line format for raw data as for instructions, with
-    no function header of its own -- so the last real function before it
-    (e.g. _fini) would otherwise silently absorb thousands of data-dump
-    lines as if they were its own instructions. Address-range membership is
-    immune to that, and to any other non-function content between two
-    function bodies, since it doesn't depend on what comes next in the file.
+
+def _retdec_native_category_counts(outdir, binary_path, arch, bits):
+    """name -> {"arithmetic": n, "control": n, "memory": n, "other": n} by
+    decoding the raw instruction bytes on each "0xADDR: <bytes> <mnem>" .dsm
+    line whose address falls inside the current function's own [start, end)
+    range from its "; function: NAME at START -- END" header (same regex
+    retdec_lift.py's own list_functions_from_dsm uses), via this project's
+    shared native-instruction classifier (pipeline/native_classify.py) --
+    the same rule angr/binja/pyghidra/r2's native-side counts use.
     """
-    dsm_path = Path(outdir) / f"{Path(binary_path).stem}.dsm"
-    if not dsm_path.exists():
-        return {}
     counts = {}
+    dsm_path = Path(outdir) / f"{Path(binary_path).stem}.dsm"
+    if not dsm_path.exists() or arch is None or bits is None:
+        return counts
+    md = make_disassembler(arch, bits)
+    if md is None:
+        return counts
+    family = arch_family(arch, bits)
+
     current_name = None
     current_start = current_end = None
     with open(dsm_path, "r", errors="replace") as f:
@@ -108,66 +178,129 @@ def _retdec_native_instruction_counts(outdir, binary_path):
                 current_name = match["name"]
                 current_start = int(match["start"], 16)
                 current_end = int(match["end"], 16)
-                counts[current_name] = 0
+                counts[current_name] = _empty_counts()
                 continue
             if current_name is None:
                 continue
-            instr_match = DSM_INSTRUCTION_ADDR_RE.match(line)
+            instr_match = DSM_INSTRUCTION_RE.match(line)
             if not instr_match:
                 continue
-            addr = int(instr_match.group(1), 16)
+            addr = int(instr_match["addr"], 16)
             if not (current_start <= addr < current_end):
                 # Past this function's declared byte range (data segment,
                 # gap, or anything else not covered by a header) -- stop
                 # attributing lines to it until the next real header.
                 current_name = None
                 continue
-            counts[current_name] += 1
+            data = bytes.fromhex(instr_match["bytes"].replace(" ", ""))
+            decoded = next(classify_bytes(md, data, addr, family), None)
+            if decoded is not None:
+                counts[current_name][decoded[3]] += 1
     return counts
+
+
+def _retdec_ir_category_counts(outdir, binary_path):
+    """name -> {"arithmetic": n, "control": n, "memory": n, "other": n} by
+    walking whole_binary.ll's top-level `define` blocks with the same
+    brace-depth tracking retdec_lift.py's own split_ll_by_function uses
+    (RetDec doesn't nest functions, but a naive line-range split without
+    brace tracking would break on functions containing nested `{`/`}` in
+    literals), classifying every line inside each function's body with
+    classify_ll_line.
+    """
+    ll_path = Path(outdir) / "whole_binary.ll"
+    if not ll_path.exists():
+        return {}
+    lines = ll_path.read_text(errors="replace").splitlines()
+    counts = {}
+
+    i = 0
+    while i < len(lines):
+        match = LL_DEFINE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        name = match["name"]
+        start = i
+        depth = 0
+        j = i
+        while j < len(lines):
+            depth += lines[j].count("{") - lines[j].count("}")
+            j += 1
+            if depth == 0 and j > start:
+                break
+        func_counts = _empty_counts()
+        for line in lines[start:j]:
+            func_counts[classify_ll_line(line)] += 1
+        counts[name] = func_counts
+        i = j
+    return counts
+
+
+def _record_category_counts(record):
+    """(ir_counts, native_counts) for one non-retdec lift_records.json
+    entry, from the ir_ops_{category}/native_{category} fields each
+    backend's lift_function now produces.
+    """
+    ir_counts = {c: record.get(f"ir_ops_{c}") for c in CATEGORIES}
+    native_counts = {c: record.get(f"native_{c}") for c in CATEGORIES}
+    return ir_counts, native_counts
 
 
 @register_block("verbosity")
 def compute(runs, results_dir):
     completed = [r for r in runs if r.get("status") == "ok" and r["backend"] in IR_SIZE_FIELDS]
 
-    overall = []
-    by_backend = defaultdict(list)
+    overall = {cat: [] for cat in RATIO_CATEGORIES}
+    by_backend = defaultdict(lambda: {cat: [] for cat in RATIO_CATEGORIES})
     rows = []
 
     for run in completed:
         backend = run["backend"]
         ir_field = IR_SIZE_FIELDS[backend]
         meta = run.get("binary_meta") or {}
-        retdec_native_counts = (
-            _retdec_native_instruction_counts(run["outdir"], run["binary"])
-            if backend == "retdec" else None
-        )
+
+        retdec_ir_counts = retdec_native_counts = None
+        if backend == "retdec":
+            retdec_ir_counts = _retdec_ir_category_counts(run["outdir"], run["binary"])
+            retdec_native_counts = _retdec_native_category_counts(
+                run["outdir"], run["binary"], meta.get("arch"), meta.get("bits")
+            )
 
         for record in _load_lift_records(run["outdir"]):
             if record.get("status") != "ok":
                 continue
-            native_count = (
-                retdec_native_counts.get(record.get("function"))
-                if retdec_native_counts is not None
-                else record.get(NATIVE_FIELD)
-            )
-            ratio = expansion_ratio(record.get(ir_field), native_count)
-            if ratio is None:
-                continue
-            rows.append({
+            function = record.get("function")
+
+            if backend == "retdec":
+                ir_counts = retdec_ir_counts.get(function, _empty_counts())
+                native_counts = retdec_native_counts.get(function, _empty_counts())
+            else:
+                ir_counts, native_counts = _record_category_counts(record)
+
+            row = {
                 "binary": Path(run["binary"]).name,
                 "backend": backend,
                 "arch": meta.get("arch"),
                 "bits": meta.get("bits"),
                 "opt": meta.get("opt"),
                 "compiler": meta.get("compiler"),
-                "function": record.get("function"),
+                "function": function,
                 "ir_size": record.get(ir_field),
-                "num_native_instructions": native_count,
-                "expansion_ratio_ops": ratio,
-            })
-            overall.append(ratio)
-            by_backend[backend].append(ratio)
+            }
+            any_ratio = False
+            for cat in RATIO_CATEGORIES:
+                ratio = expansion_ratio(ir_counts.get(cat), native_counts.get(cat))
+                row[f"ir_ops_{cat}"] = ir_counts.get(cat)
+                row[f"native_{cat}"] = native_counts.get(cat)
+                row[f"expansion_ratio_{cat}"] = ratio
+                if ratio is not None:
+                    any_ratio = True
+                    overall[cat].append(ratio)
+                    by_backend[backend][cat].append(ratio)
+            if not any_ratio:
+                continue
+            rows.append(row)
 
     return {
         "block": "verbosity",
@@ -175,10 +308,11 @@ def compute(runs, results_dir):
         "num_runs_total": len(runs),
         "num_functions_evaluated": len(rows),
         "metrics": {
-            "expansion_ratio_ops": {**METRICS["expansion_ratio_ops"], **(aggregate_stats(overall) or {"n": 0})},
+            f"expansion_ratio_{cat}": {**METRICS[f"expansion_ratio_{cat}"], **(aggregate_stats(overall[cat]) or {"n": 0})}
+            for cat in RATIO_CATEGORIES
         },
         "by_backend": {
-            backend: {"expansion_ratio_ops": aggregate_stats(vals)}
+            backend: {f"expansion_ratio_{cat}": aggregate_stats(vals[cat]) for cat in RATIO_CATEGORIES}
             for backend, vals in by_backend.items()
         },
         "rows": rows,

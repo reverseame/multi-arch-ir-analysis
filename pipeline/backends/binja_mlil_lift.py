@@ -20,8 +20,11 @@ from pipeline.common import (
     write_summary,
     write_whole_binary_dump,
 )
+from pipeline.binja_il_classify import classify_il_function, classify_native_instructions
 
 from binaryninja import load
+
+CATEGORIES = ("arithmetic", "control", "memory", "other")
 
 
 def list_functions(bv):
@@ -37,7 +40,7 @@ def list_functions(bv):
     return functions
 
 
-def lift_function(func):
+def lift_function(func, bv):
     mlil = func.mlil
     lines = [f"; ---- function {func.name} @ {hex(func.start)} ----"]
     num_instructions = 0
@@ -47,7 +50,9 @@ def lift_function(func):
     text = "\n".join(lines)
     # func.instructions for expansion ratio.
     num_native_instructions = sum(1 for _ in func.instructions)
-    return num_instructions, num_native_instructions, text
+    ir_counts = classify_il_function(mlil)
+    native_counts = classify_native_instructions(func, bv)
+    return num_instructions, num_native_instructions, ir_counts, native_counts, text
 
 
 def run(binary_path, outdir, limit):
@@ -76,10 +81,13 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, n_native, text = lift_function(func)
+                        n_instr, n_native, ir_counts, native_counts, text = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
+                        for cat in CATEGORIES:
+                            record[f"ir_ops_{cat}"] = ir_counts[cat]
+                            record[f"native_{cat}"] = native_counts[cat]
                         whole_binary_chunks.append((func.start, text))
                     except Exception as e:
                         record["status"] = "error"

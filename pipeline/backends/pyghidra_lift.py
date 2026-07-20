@@ -29,16 +29,80 @@ from pipeline.common import (
     write_summary,
     write_whole_binary_dump,
 )
+from pipeline.native_classify import arch_family, classify_bytes, make_disassembler
 
-import pyghidra  
+import pyghidra
 
 pyghidra.start()
 
-from java.lang import Exception as JavaException  
-from ghidra.app.decompiler import DecompInterface, DecompileOptions  
-from ghidra.util.task import ConsoleTaskMonitor  
+from java.lang import Exception as JavaException
+from ghidra.app.decompiler import DecompInterface, DecompileOptions
+from ghidra.util.task import ConsoleTaskMonitor
 
 DEFAULT_DECOMP_TIMEOUT_S = 60
+
+CATEGORIES = ("arithmetic", "control", "memory", "other")
+
+# High P-code opcode mnemonics (ghidra.program.model.pcode.PcodeOp.getMnemonic,
+# enumerated 0-74 in this Ghidra build), classified the same way as the other
+# backends' IR: real ALU/compare/float work is "arithmetic", memory traffic is
+# "memory", branches/calls/returns are "control", and pure bookkeeping/type
+# machinery (SSA phi-nodes, casts, zero/sign-extension, CALLOTHER pcode
+# userops, ...) is "other".
+_PCODE_CONTROL = {"BRANCH", "CBRANCH", "BRANCHIND", "CALL", "CALLIND", "CALLOTHER", "RETURN"}
+_PCODE_MEMORY = {"LOAD", "STORE"}
+_PCODE_ARITHMETIC = {
+    "INT_EQUAL", "INT_NOTEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "INT_LESS", "INT_LESSEQUAL",
+    "INT_ADD", "INT_SUB", "INT_CARRY", "INT_SCARRY", "INT_SBORROW", "INT_2COMP", "INT_NEGATE",
+    "INT_XOR", "INT_AND", "INT_OR", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT",
+    "INT_MULT", "INT_DIV", "INT_SDIV", "INT_REM", "INT_SREM",
+    "BOOL_NEGATE", "BOOL_XOR", "BOOL_AND", "BOOL_OR",
+    "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL", "FLOAT_NAN",
+    "FLOAT_ADD", "FLOAT_DIV", "FLOAT_MULT", "FLOAT_SUB", "FLOAT_NEG", "FLOAT_ABS", "FLOAT_SQRT",
+    "POPCOUNT", "LZCOUNT", "PTRADD", "PTRSUB",
+}
+
+_PCODE_LANG_ARCH_KEY = {
+    "x86": "x86",
+    "ARM": "arm",
+    "AARCH64": "arm",
+    "MIPS": "mips",
+}
+
+
+def classify_pcode_op(mnemonic):
+    if mnemonic in _PCODE_CONTROL:
+        return "control"
+    if mnemonic in _PCODE_MEMORY:
+        return "memory"
+    if mnemonic in _PCODE_ARITHMETIC:
+        return "arithmetic"
+    return "other"
+
+
+def pyghidra_arch_key(language):
+    """(arch, bits) in this project's metadata.json convention (see
+    pipeline/native_classify.py) for a Ghidra Language, from its
+    "FAMILY:ENDIAN:BITS:VARIANT" LanguageID (e.g. "x86:LE:32:default",
+    "ARM:LE:32:v8", "MIPS:BE:32:default"), or None if unsupported.
+
+    ARM32 is always treated as non-Thumb (CS_MODE_ARM): Ghidra tracks
+    per-instruction Thumb/ARM mode via a "TMode" context register, but every
+    arm/32 binary in this project's own corpus disassembles as pure ARM (no
+    Thumb interworking) when checked with r2 (`aflj`'s per-function "bits"
+    was 32, never 16, across ls/arm/32 binaries) -- not worth the extra
+    per-instruction context lookup for a mode that doesn't occur here.
+    """
+    parts = str(language.getLanguageID()).split(":")
+    if len(parts) != 4:
+        return None
+    family, endian, bits_str, _variant = parts
+    arch = _PCODE_LANG_ARCH_KEY.get(family)
+    if arch is None:
+        return None
+    if arch == "mips" and endian == "BE":
+        arch = "mipseb"
+    return (arch, int(bits_str))
 
 
 def varnode_high_str(vn, language):
@@ -100,7 +164,7 @@ def list_functions(program):
     return functions
 
 
-def lift_function(ifc, func, language, monitor, timeout_s, listing):
+def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
     result = ifc.decompileFunction(func, timeout_s, monitor)
     if not result.decompileCompleted():
         msg = result.getErrorMessage() or "timeout/cancelled"
@@ -113,6 +177,7 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing):
     lines = [f"; ---- function {func.getName()} @ {func.getEntryPoint()} ----"]
     total_ops = 0
     current_addr = None
+    ir_counts = {c: 0 for c in CATEGORIES}
     op_iter = high_func.getPcodeOps()
     while op_iter.hasNext():
         op = op_iter.next()
@@ -122,13 +187,22 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing):
             current_addr = addr
         lines.append(f"  {pcodeop_high_str(op, language)}")
         total_ops += 1
+        ir_counts[classify_pcode_op(op.getMnemonic())] += 1
 
     # Native disassembly instruction count over the function's own address
     # range for obtaining expansion ratio.
-    num_native_instructions = sum(1 for _ in listing.getInstructions(func.getBody(), True))
+    native_counts = {c: 0 for c in CATEGORIES}
+    num_native_instructions = 0
+    for insn in listing.getInstructions(func.getBody(), True):
+        num_native_instructions += 1
+        if md is not None:
+            data = bytes(insn.getBytes())
+            decoded = next(classify_bytes(md, data, int(insn.getMinAddress().getOffset()), family), None)
+            if decoded is not None:
+                native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, text
+    return total_ops, num_native_instructions, ir_counts, native_counts, text
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -165,6 +239,10 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
 
                 try:
                     language = program.getLanguage()
+                    arch_key = pyghidra_arch_key(language)
+                    md = make_disassembler(*arch_key) if arch_key else None
+                    family = arch_family(*arch_key) if arch_key else None
+
                     functions = list_functions(program)
                     write_json(outdir / "functions.json", {
                         "binary": str(binary_path),
@@ -196,10 +274,15 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, n_native, text = lift_function(ifc, func, language, monitor, decomp_timeout_s, listing)
+                                n_ops, n_native, ir_counts, native_counts, text = lift_function(
+                                    ifc, func, language, monitor, decomp_timeout_s, listing, md, family
+                                )
                                 record["status"] = "ok"
                                 record["num_pcode_ops"] = n_ops
                                 record["num_native_instructions"] = n_native
+                                for cat in CATEGORIES:
+                                    record[f"ir_ops_{cat}"] = ir_counts[cat]
+                                    record[f"native_{cat}"] = native_counts[cat]
                                 whole_binary_chunks.append((int(func.getEntryPoint().getOffset()), text))
                             except (JavaException, Exception) as e:
                                 record["status"] = "error"

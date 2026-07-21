@@ -11,17 +11,23 @@ HighLevelILOperation directly. That means one suffix-keyed table, applied
 after stripping the level's own prefix, covers all three levels instead of
 duplicating near-identical tables three times.
 
-Classification walks the *entire* expression tree (every instruction and
-every sub-expression, via `il_func.traverse()` -- the same traversal
-pipeline/metrics/binja_invariance.py already uses for opcode-frequency
-histograms), not just top-level instructions. This matters most at HLIL:
-a single top-level `if (a + b > c)` is one HLIL_IF instruction, but the
-addition and comparison it contains are real operations that would
-otherwise vanish from the count entirely -- undercounting is exactly the
-failure mode being measured (IR verbosity/expansion), so it can't be
-skipped. This is a deliberately different unit than num_{llil,mlil,hlil}_
-instructions (top-level only, existing field, left unchanged) -- the two
-aren't meant to sum to the same total.
+Two classification granularities are provided, both used by expansion-ratio
+metrics (pipeline/metrics/blocks/verbosity.py):
+
+  - classify_il_function_ops: one label per top-level instruction only
+    (`il_func.instructions`) -- the same counting unit as
+    num_{llil,mlil,hlil}_instructions.
+  - classify_il_function_ast: walks the *entire* expression tree (every
+    instruction and every sub-expression, via `il_func.traverse()` -- the
+    same traversal pipeline/metrics/binja_invariance.py already uses for
+    opcode-frequency histograms). This matters most at HLIL: a single
+    top-level `if (a + b > c)` is one HLIL_IF instruction, but the addition
+    and comparison it contains are real operations that would otherwise
+    vanish from the count entirely -- undercounting is exactly the failure
+    mode being measured (IR verbosity/expansion), so it can't be skipped.
+
+The two aren't meant to sum to the same total -- they're deliberately
+different units, reported side by side.
 
 Type-conversion/reinterpret ops (SX, ZX, LOW_PART, FLOAT_CONV, FLOAT_TO_INT,
 INT_TO_FLOAT, BOOL_TO_INT, ROUND_TO_INT, FLOOR, CEIL, FTRUNC) are
@@ -67,19 +73,43 @@ _MEMORY_SUFFIXES = {
     "DEREF_SSA", "DEREF_FIELD_SSA", "ASSIGN_MEM_SSA", "ASSIGN_UNPACK_MEM_SSA",
 }
 
+# Pure register/variable/flag assignment forms -- SET_REG, SET_VAR, SET_FLAG,
+# HLIL_ASSIGN, and their split/field/SSA variants. Their own top-level
+# operation carries no information about what's being computed (every one of
+# them would otherwise land in "other"); the real operation is nested in
+# their *source expression* (`.src`), e.g. `esp = esp - 8` is one
+# LLIL_SET_REG instruction wrapping a nested SUB. Mirrors angr_lift.py's
+# treatment of VEX's Ist_WrTmp/Ist_Put, which inherit from stmt.data for
+# exactly the same reason. Deliberately excludes the _MEM_SSA forms
+# (ASSIGN_MEM_SSA, ASSIGN_UNPACK_MEM_SSA) already in _MEMORY_SUFFIXES above
+# -- a memory *write* is a memory op by its own destination, not by its
+# source, matching VEX's Ist_Store staying "memory" regardless of what it
+# stores.
+_ASSIGN_SUFFIXES = {
+    "SET_REG", "SET_REG_SPLIT", "SET_REG_SSA", "SET_REG_SPLIT_SSA", "SET_REG_SSA_PARTIAL",
+    "SET_REG_STACK_REL", "SET_REG_STACK_REL_SSA", "SET_REG_STACK_ABS_SSA",
+    "SET_FLAG", "SET_FLAG_SSA",
+    "SET_VAR", "SET_VAR_FIELD", "SET_VAR_SPLIT", "SET_VAR_SPLIT_SSA",
+    "SET_VAR_SSA", "SET_VAR_SSA_FIELD", "SET_VAR_ALIASED", "SET_VAR_ALIASED_FIELD",
+    "ASSIGN", "ASSIGN_UNPACK",
+}
+
 _LEVEL_PREFIXES = ("LLIL_", "MLIL_", "HLIL_")
+
+
+def _il_suffix(operation_name):
+    """`operation.name` (e.g. "LLIL_ADD") with its level prefix stripped."""
+    for prefix in _LEVEL_PREFIXES:
+        if operation_name.startswith(prefix):
+            return operation_name[len(prefix):]
+    return operation_name
 
 
 def classify_il_operation(operation_name):
     """`operation.name` (e.g. "LLIL_ADD", "HLIL_DEREF") -> "arithmetic" /
     "control" / "memory" / "other".
     """
-    suffix = operation_name
-    for prefix in _LEVEL_PREFIXES:
-        if operation_name.startswith(prefix):
-            suffix = operation_name[len(prefix):]
-            break
-
+    suffix = _il_suffix(operation_name)
     if suffix in _CONTROL_SUFFIXES:
         return "control"
     if suffix in _MEMORY_SUFFIXES:
@@ -89,7 +119,34 @@ def classify_il_operation(operation_name):
     return "other"
 
 
-def classify_il_function(il_func):
+def classify_il_instruction_ops(instr):
+    """One top-level IL instruction -> "arithmetic"/"control"/"memory"/
+    "other", the ops-level / flat granularity. Pure assignment forms
+    (see _ASSIGN_SUFFIXES) inherit from their source expression's own
+    top-level operation (`instr.src.operation.name`) instead of their own --
+    otherwise `esp = esp - 8` would classify as "other" via SET_REG rather
+    than "arithmetic" via the nested SUB it wraps.
+    """
+    suffix = _il_suffix(instr.operation.name)
+    if suffix in _ASSIGN_SUFFIXES:
+        return classify_il_operation(instr.src.operation.name)
+    return classify_il_operation(instr.operation.name)
+
+
+def classify_il_function_ops(il_func):
+    """{"arithmetic": n, "control": n, "memory": n, "other": n} over every
+    top-level instruction in `il_func` (LLIL/MLIL/HLIL) only -- the ops-level
+    / flat granularity, one label per instruction, not descending into
+    sub-expressions. See module docstring for how this differs from
+    classify_il_function_ast.
+    """
+    counts = {"arithmetic": 0, "control": 0, "memory": 0, "other": 0}
+    for instr in il_func.instructions:
+        counts[classify_il_instruction_ops(instr)] += 1
+    return counts
+
+
+def classify_il_function_ast(il_func):
     """{"arithmetic": n, "control": n, "memory": n, "other": n} over every
     instruction and sub-expression in `il_func` (LLIL/MLIL/HLIL), via the
     same il_func.traverse() binja_invariance.py already uses.

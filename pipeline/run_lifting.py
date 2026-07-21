@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -47,6 +49,36 @@ def default_python():
     return sys.executable
 
 
+def run_subprocess_with_rusage(cmd, cwd, timeout_s, stdout_path, stderr_path):
+    """Run cmd as a subprocess and return (returncode, wall_time_s, max_rss_kb, timed_out).
+
+    This allows to record the maximum resource usage of each backend execution.
+    """
+    with open(stdout_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
+        t0 = time.perf_counter()
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_f, stderr=err_f)
+
+        reaped = {}
+
+        def reap():
+            reaped["result"] = os.wait4(proc.pid, 0)
+
+        reaper = threading.Thread(target=reap, daemon=True)
+        reaper.start()
+        reaper.join(timeout_s)
+
+        timed_out = reaper.is_alive()
+        if timed_out:
+            proc.kill()
+            reaper.join()
+
+        wall_time_s = time.perf_counter() - t0
+        _, status, rusage = reaped["result"]
+
+    returncode = os.waitstatus_to_exitcode(status)
+    return returncode, wall_time_s, rusage.ru_maxrss, timed_out
+
+
 def run_one(python_exe, backend, module, binary, outdir, limit, timeout_s, retdec_bin):
     ensure_dir(outdir)
     cmd = [python_exe, "-m", module, "--binary", str(binary), "--outdir", str(outdir)]
@@ -55,26 +87,29 @@ def run_one(python_exe, backend, module, binary, outdir, limit, timeout_s, retde
     if backend == "retdec" and retdec_bin:
         cmd += ["--retdec-bin", str(retdec_bin)]
 
-    t0 = time.perf_counter()
+    stdout_path = outdir / "orchestrator_stdout.log"
+    stderr_path = outdir / "orchestrator_stderr.log"
     record = {"binary": str(binary), "backend": backend, "outdir": str(outdir)}
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=timeout_s
+        returncode, wall_time_s, max_rss_kb, timed_out = run_subprocess_with_rusage(
+            cmd, str(REPO_ROOT), timeout_s, stdout_path, stderr_path
         )
-        record["returncode"] = proc.returncode
-        record["status"] = "ok" if proc.returncode == 0 else "failed"
-        if proc.returncode != 0:
-            (outdir / "orchestrator_stdout.log").write_text(proc.stdout)
-            (outdir / "orchestrator_stderr.log").write_text(proc.stderr)
-    except subprocess.TimeoutExpired:
-        record["status"] = "timeout"
-        record["returncode"] = None
+        record["returncode"] = returncode
+        record["wall_time_s"] = wall_time_s
+        record["max_rss_kb"] = max_rss_kb
+        if timed_out:
+            record["status"] = "timeout"
+        else:
+            record["status"] = "ok" if returncode == 0 else "failed"
+            if record["status"] == "ok":
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
     except Exception as e:
         record["status"] = "crashed"
         record["returncode"] = None
+        record["wall_time_s"] = None
+        record["max_rss_kb"] = None
         record["error"] = f"{type(e).__name__}: {e}"
-
-    record["wall_time_s"] = time.perf_counter() - t0
 
     if record["status"] == "ok":
         print(f"  {backend:<12} OK")

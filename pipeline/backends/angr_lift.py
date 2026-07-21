@@ -66,6 +66,10 @@ def angr_arch_key(arch):
 
 
 def _classify_vex_expr(expr):
+    """One VEX IRExpr node -> "arithmetic"/"memory"/"other". Never "control"
+    -- VEX represents control flow only at the statement (Ist_Exit) and
+    block-exit (irsb.next) level, never inside an expression node itself.
+    """
     tag = expr.tag
     if tag == "Iex_Load":
         return "memory"
@@ -74,20 +78,51 @@ def _classify_vex_expr(expr):
     return "other"
 
 
-def classify_vex_statement(stmt):
-    """One VEX IRStmt -> "arithmetic"/"control"/"memory"/"other". Ist_WrTmp
-    and Ist_Put are classified by their *source expression* (a temp/register
-    write is only as interesting as the value computed for it) so that
-    e.g. `PUT(offset=68) = 0x08057613`
+def _classify_vex_statement_tag(stmt):
+    """The statement's own node, by VEX statement tag alone. Ist_WrTmp and
+    Ist_Put no longer inherit from their source expression's classification
+    -- that expression (and everything nested inside it) is now walked and
+    counted as its own separate node(s), see classify_vex_statement_ast.
     """
     tag = stmt.tag
     if tag == "Ist_Exit":
         return "control"
     if tag in ("Ist_Store", "Ist_StoreG", "Ist_LoadG", "Ist_CAS", "Ist_LLSC"):
         return "memory"
-    if tag in ("Ist_WrTmp", "Ist_Put"):
+    return "other"  # Ist_WrTmp, Ist_Put, Ist_IMark, Ist_PutI, Ist_Dirty, Ist_AbiHint, Ist_NoOp, Ist_MBE
+
+
+def classify_vex_statement_ops(stmt):
+    """One VEX IRStmt -> a single "arithmetic"/"control"/"memory"/"other"
+    label, by its own top-level node only: Ist_WrTmp/Ist_Put inherit from
+    their *source expression's own top-level tag* (not descending into
+    whatever that expression nests), everything else via
+    _classify_vex_statement_tag. This is the ops-level / flat granularity --
+    one label per statement, the same counting unit as num_statements --
+    kept alongside classify_vex_statement_ast's deeper per-AST-node count so
+    expansion-ratio can be reported at both granularities.
+    """
+    if stmt.tag in ("Ist_WrTmp", "Ist_Put"):
         return _classify_vex_expr(stmt.data)
-    return "other"  # Ist_IMark, Ist_PutI, Ist_Dirty, Ist_AbiHint, Ist_NoOp, Ist_MBE
+    return _classify_vex_statement_tag(stmt)
+
+
+def classify_vex_statement_ast(stmt):
+    """One VEX IRStmt -> list of "arithmetic"/"control"/"memory"/"other"
+    labels, one per AST node: the statement's own node
+    (_classify_vex_statement_tag) plus every sub-expression in its tree,
+    classified individually via _classify_vex_expr.
+
+    stmt.child_expressions (pyvex.expr.IRExpr.child_expressions) is already
+    fully recursive -- it descends into every IRExpr-valued slot and
+    flattens the whole subtree -- so no manual recursion is needed here.
+    This mirrors pipeline/binja_il_classify.py's classify_il_function_ast,
+    which does the same full-expression-tree walk for LLIL/MLIL/HLIL via
+    il_func.traverse().
+    """
+    labels = [_classify_vex_statement_tag(stmt)]
+    labels.extend(_classify_vex_expr(expr) for expr in stmt.child_expressions)
+    return labels
 
 
 def list_functions(cfg):
@@ -109,7 +144,8 @@ def lift_function(proj, func, cs_arch, family):
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
     total_native_instructions = 0
-    ir_counts = {c: 0 for c in CATEGORIES}
+    ir_ops_counts = {c: 0 for c in CATEGORIES}
+    ir_ast_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
     for block in func.blocks:
         data = proj.loader.memory.load(block.addr, block.size)
@@ -117,15 +153,25 @@ def lift_function(proj, func, cs_arch, family):
         lines.append(f"; ---- block 0x{block.addr:x} (size={block.size}) ----")
         for stmt in irsb.statements:
             lines.append(f"  {stmt}")
-            ir_counts[classify_vex_statement(stmt)] += 1
+            ir_ops_counts[classify_vex_statement_ops(stmt)] += 1
+            for label in classify_vex_statement_ast(stmt):
+                ir_ast_counts[label] += 1
         lines.append(f"  NEXT: {irsb.next} ; jumpkind={irsb.jumpkind}")
         lines.append("")
         total_statements += len(irsb.statements)
         # The block's own terminating jump/call/ret/conditional-fallthrough
         # (irsb.next/jumpkind) isn't part of irsb.statements -- VEX always
         # keeps it separate -- so it needs to be added to the control count
-        # by hand; skipping it would undercount "control" statements
-        ir_counts["control"] += 1
+        # by hand; skipping it would undercount "control" statements. At the
+        # ops/flat granularity that's the whole story (one label for the
+        # terminator). At the AST granularity, its target expression (a bare
+        # Const for direct jumps, but a computed expression for indirect
+        # jumps/calls through a register) is additionally walked the same
+        # way as any other statement's expression tree.
+        ir_ops_counts["control"] += 1
+        ir_ast_counts["control"] += 1
+        for expr in irsb.next.child_expressions:
+            ir_ast_counts[_classify_vex_expr(expr)] += 1
 
         # block.instructions for expansion ratio
         total_native_instructions += block.instructions
@@ -134,7 +180,7 @@ def lift_function(proj, func, cs_arch, family):
                 native_counts[classify_insn(wrapped.insn, cs_arch, family)] += 1
 
     text = "\n".join(lines)
-    return total_statements, total_native_instructions, ir_counts, native_counts, text
+    return total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
 
 
 def run(binary_path, outdir, limit):
@@ -174,12 +220,15 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_stmts, n_native, ir_counts, native_counts, text = lift_function(proj, func, cs_arch, family)
+                    n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(
+                        proj, func, cs_arch, family
+                    )
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
                     record["num_native_instructions"] = n_native
                     for cat in CATEGORIES:
-                        record[f"ir_ops_{cat}"] = ir_counts[cat]
+                        record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
+                        record[f"ir_ast_{cat}"] = ir_ast_counts[cat]
                         record[f"native_{cat}"] = native_counts[cat]
                     whole_binary_chunks.append((func.addr, text))
                 except Exception as e:

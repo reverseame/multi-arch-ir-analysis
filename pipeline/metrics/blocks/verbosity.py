@@ -1,27 +1,54 @@
 """Verbosity metrics block: IR-size expansion ratio, per (binary, backend,
-function), classified by native-instruction type -- arithmetic, control, or
-memory -- from possible_metrics.txt's "IR-size expansion ratio":
-expansion_ratio_{arithmetic,control,memory} = (IR ops of that category) /
-(native instructions of that category), within one function. No cross-backend
-function matching is needed: the comparison is IR size vs. native size
-*within* the same backend's own run, unlike the cross-architecture invariance
-metrics in binja_invariance.py.
+function), from possible_metrics.txt's "IR-size expansion ratio". Reports
+two independent axes side by side:
+
+  - granularity: "ops" (one count per top-level instruction/statement,
+    e.g. num_llil_instructions, num_statements, num_pcode_ops, ...) vs.
+    "ast" (one count per AST/expression-tree node, descending into every
+    sub-expression -- see below for which backends this actually differs
+    for).
+  - category split: a plain total (expansion_ratio_ops / expansion_ratio_ast)
+    vs. broken down by instruction type (expansion_ratio_ops_{arithmetic,
+    control,memory} / expansion_ratio_ast_{arithmetic,control,memory}).
+
+That's 2x2 = 8 metrics total, all descriptive, all (IR count) / (native
+instruction count) within one function -- no cross-backend function matching
+is needed for any of them: the comparison is IR size vs. native size
+*within* the same backend's own run, unlike the cross-architecture
+invariance metrics in binja_invariance.py.
 
 Both sides of the ratio are classified by the same rule for a given category
 (see pipeline/native_classify.py for the native side; each backend module's
-own IR-op classifier for the numerator -- angr_lift.classify_vex_statement,
-binja_il_classify.classify_il_operation, pyghidra_lift.classify_pcode_op,
-r2_lift.classify_esil_expression, and this module's classify_ll_line for
-retdec's LLVM IR). "other" (data movement, casts, SSA bookkeeping, NOPs) is
-computed too but not reported as a ratio -- see each classifier's own
-docstring for why it's excluded (mainly: type conversions/reinterprets are
-deliberately not counted as "arithmetic" everywhere, consistently).
+own IR-op classifier for the numerator -- angr_lift.classify_vex_statement_
+{ops,ast}, binja_il_classify.classify_il_function_{ops,ast}, pyghidra_lift.
+classify_pcode_op, r2_lift.classify_esil_expression, and this module's
+classify_ll_line for retdec's LLVM IR). "other" (data movement, casts, SSA
+bookkeeping, NOPs) is computed too and counted into the *_ops/*_ast totals,
+but not reported as its own ratio -- see each classifier's own docstring for
+why it's excluded from the category breakdown (mainly: type conversions/
+reinterprets are deliberately not counted as "arithmetic" everywhere,
+consistently).
+
+The ops/ast distinction only actually differs for VEX (angr) and Binary
+Ninja's LLIL/MLIL/HLIL -- the two backends whose IR can nest sub-expressions
+inside a single instruction/statement (angr_lift.classify_vex_statement_ast
+walks every statement's full expression tree via pyvex's already-recursive
+IRExpr.child_expressions; binja_il_classify.classify_il_function_ast walks
+every instruction and sub-expression via il_func.traverse()) -- e.g.
+`t5 = Add32(Mul32(t1,t2), t3)` counts as one "arithmetic" node at the ops
+granularity (the whole statement) but two at the ast granularity (the Add
+and the Mul). pyghidra (P-code), r2 (ESIL), and retdec (LLVM IR text) are
+already atomic/flat at the operation level -- their ops and ast numbers are
+identical by construction (same underlying count, reported under both
+names) since there's no nesting to distinguish.
 
 Per-function category counts come from two different places depending on
 the backend:
   - angr/binja/pyghidra/r2 record them directly in lift_records.json (the
-    ir_ops_{category}/native_{category} fields each backend's lift_function
-    now produces), because computing the native side needs their own
+    ir_ops_{category}/ir_ast_{category}/native_{category} fields each
+    backend's lift_function now produces -- pyghidra/r2 only produce
+    ir_ops_{category}, since ops==ast for them; see _record_category_counts'
+    fallback), because computing the native side needs their own
     already-open session (loaded VEX blocks, an open Binary Ninja database,
     an open Ghidra program, a live r2 session) -- getting it later here
     would mean reloading the whole binary in that tool, far more expensive
@@ -68,6 +95,7 @@ from pipeline.native_classify import arch_family, classify_bytes, make_disassemb
 
 CATEGORIES = ("arithmetic", "control", "memory", "other")
 RATIO_CATEGORIES = ("arithmetic", "control", "memory")
+GRANULARITIES = ("ops", "ast")
 
 # Backends whose lift_records.json already carries per-category
 # ir_ops_{category}/native_{category} fields (see each backend module).
@@ -86,10 +114,26 @@ IR_SIZE_FIELDS = {
 
 DSM_INSTRUCTION_RE = re.compile(r"^0x(?P<addr>[0-9a-fA-F]+):\s+(?P<bytes>[0-9a-fA-F ]+?)\s*\t")
 
-METRICS = {
-    f"expansion_ratio_{cat}": {"direction": "descriptive", "unit": "ir_ops / native_instr"}
-    for cat in RATIO_CATEGORIES
-}
+
+def _ratio_keys():
+    keys = []
+    for gran in GRANULARITIES:
+        keys.append(gran)
+        keys.extend(f"{gran}_{cat}" for cat in RATIO_CATEGORIES)
+    return tuple(keys)
+
+
+RATIO_KEYS = _ratio_keys()
+
+METRICS = {}
+for _gran in GRANULARITIES:
+    METRICS[f"expansion_ratio_{_gran}"] = {
+        "direction": "descriptive", "unit": "ir_ops_or_lines / native_instr"
+    }
+    for _cat in RATIO_CATEGORIES:
+        METRICS[f"expansion_ratio_{_gran}_{_cat}"] = {
+            "direction": "descriptive", "unit": "ir_ops / native_instr"
+        }
 
 # LLVM IR opcode -> category, keyed off the same three buckets every other
 # backend's IR classifier uses (see module docstring). Type-conversion/cast
@@ -207,6 +251,11 @@ def _retdec_ir_category_counts(outdir, binary_path):
     brace tracking would break on functions containing nested `{`/`}` in
     literals), classifying every line inside each function's body with
     classify_ll_line.
+
+    LLVM IR text is already atomic/flat at the operation level -- one
+    "opcode token" per line, no sub-expression nesting -- so this single
+    count serves as both the ops-level and ast-level numerator for retdec
+    (see module docstring); the caller uses the same dict for both.
     """
     ll_path = Path(outdir) / "whole_binary.ll"
     if not ll_path.exists():
@@ -238,21 +287,38 @@ def _retdec_ir_category_counts(outdir, binary_path):
 
 
 def _record_category_counts(record):
-    """(ir_counts, native_counts) for one non-retdec lift_records.json
-    entry, from the ir_ops_{category}/native_{category} fields each
-    backend's lift_function now produces.
+    """(ops_counts, ast_counts, native_counts) for one non-retdec
+    lift_records.json entry, from the ir_ops_{category}/ir_ast_{category}/
+    native_{category} fields each backend's lift_function now produces.
+
+    Only angr and the three Binary Ninja backends produce ir_ast_{category}
+    (their IR can nest sub-expressions -- see module docstring); pyghidra
+    and r2 only produce ir_ops_{category}, so ast_counts falls back to the
+    same ops values for them (ops and ast are identical by construction
+    there, no nesting to distinguish).
     """
-    ir_counts = {c: record.get(f"ir_ops_{c}") for c in CATEGORIES}
+    ops_counts = {c: record.get(f"ir_ops_{c}") for c in CATEGORIES}
+    ast_counts = {c: record.get(f"ir_ast_{c}", record.get(f"ir_ops_{c}")) for c in CATEGORIES}
     native_counts = {c: record.get(f"native_{c}") for c in CATEGORIES}
-    return ir_counts, native_counts
+    return ops_counts, ast_counts, native_counts
+
+
+def _total(counts):
+    """Sum of all four category counts, or None if any is missing (rather
+    than silently treating a missing category as zero).
+    """
+    values = [counts.get(c) for c in CATEGORIES]
+    if any(v is None for v in values):
+        return None
+    return sum(values)
 
 
 @register_block("verbosity")
 def compute(runs, results_dir):
     completed = [r for r in runs if r.get("status") == "ok" and r["backend"] in IR_SIZE_FIELDS]
 
-    overall = {cat: [] for cat in RATIO_CATEGORIES}
-    by_backend = defaultdict(lambda: {cat: [] for cat in RATIO_CATEGORIES})
+    overall = {key: [] for key in RATIO_KEYS}
+    by_backend = defaultdict(lambda: {key: [] for key in RATIO_KEYS})
     rows = []
 
     for run in completed:
@@ -273,10 +339,25 @@ def compute(runs, results_dir):
             function = record.get("function")
 
             if backend == "retdec":
-                ir_counts = retdec_ir_counts.get(function, _empty_counts())
+                # LLVM IR text has no sub-expression nesting -- the same
+                # counts serve as both the ops-level and ast-level side of
+                # the ratio (see _retdec_ir_category_counts docstring).
+                ops_counts = ast_counts = retdec_ir_counts.get(function, _empty_counts())
                 native_counts = retdec_native_counts.get(function, _empty_counts())
+                # retdec has no "num_native_instructions" record field (its
+                # native side is parsed from the .dsm here, not recorded
+                # during lifting) -- the per-category counts already cover
+                # every native instruction, so their sum is the total.
+                total_native = sum(native_counts.values())
             else:
-                ir_counts, native_counts = _record_category_counts(record)
+                ops_counts, ast_counts, native_counts = _record_category_counts(record)
+                # Deliberately record["num_native_instructions"], not
+                # sum(native_counts.values()): for archs pipeline.native_classify
+                # can't disassemble (unsupported by capstone), native_counts
+                # stays all-zero while the block/function-level instruction
+                # count is still real -- summing the categories would silently
+                # zero out the denominator instead of reporting "no data".
+                total_native = record.get("num_native_instructions")
 
             row = {
                 "binary": Path(run["binary"]).name,
@@ -288,16 +369,30 @@ def compute(runs, results_dir):
                 "function": function,
                 "ir_size": record.get(ir_field),
             }
+
             any_ratio = False
-            for cat in RATIO_CATEGORIES:
-                ratio = expansion_ratio(ir_counts.get(cat), native_counts.get(cat))
-                row[f"ir_ops_{cat}"] = ir_counts.get(cat)
-                row[f"native_{cat}"] = native_counts.get(cat)
-                row[f"expansion_ratio_{cat}"] = ratio
-                if ratio is not None:
+
+            for gran, counts in (("ops", ops_counts), ("ast", ast_counts)):
+                total_ratio = expansion_ratio(_total(counts), total_native)
+                row[f"expansion_ratio_{gran}"] = total_ratio
+                if total_ratio is not None:
                     any_ratio = True
-                    overall[cat].append(ratio)
-                    by_backend[backend][cat].append(ratio)
+                    overall[gran].append(total_ratio)
+                    by_backend[backend][gran].append(total_ratio)
+
+                for cat in RATIO_CATEGORIES:
+                    ratio = expansion_ratio(counts.get(cat), native_counts.get(cat))
+                    row[f"ir_{gran}_{cat}"] = counts.get(cat)
+                    row[f"expansion_ratio_{gran}_{cat}"] = ratio
+                    if ratio is not None:
+                        any_ratio = True
+                        key = f"{gran}_{cat}"
+                        overall[key].append(ratio)
+                        by_backend[backend][key].append(ratio)
+
+            for cat in CATEGORIES:
+                row[f"native_{cat}"] = native_counts.get(cat)
+
             if not any_ratio:
                 continue
             rows.append(row)
@@ -308,11 +403,11 @@ def compute(runs, results_dir):
         "num_runs_total": len(runs),
         "num_functions_evaluated": len(rows),
         "metrics": {
-            f"expansion_ratio_{cat}": {**METRICS[f"expansion_ratio_{cat}"], **(aggregate_stats(overall[cat]) or {"n": 0})}
-            for cat in RATIO_CATEGORIES
+            f"expansion_ratio_{key}": {**METRICS[f"expansion_ratio_{key}"], **(aggregate_stats(overall[key]) or {"n": 0})}
+            for key in RATIO_KEYS
         },
         "by_backend": {
-            backend: {f"expansion_ratio_{cat}": aggregate_stats(vals[cat]) for cat in RATIO_CATEGORIES}
+            backend: {f"expansion_ratio_{key}": aggregate_stats(vals[key]) for key in RATIO_KEYS}
             for backend, vals in by_backend.items()
         },
         "rows": rows,

@@ -20,7 +20,11 @@ from pipeline.common import (
     write_summary,
     write_whole_binary_dump,
 )
-from pipeline.binja_il_classify import classify_il_function, classify_native_instructions
+from pipeline.binja_il_classify import (
+    classify_il_function_ast,
+    classify_il_function_ops,
+    classify_native_instructions,
+)
 
 from binaryninja import load
 
@@ -50,9 +54,10 @@ def lift_function(func, bv):
     text = "\n".join(lines)
     # func.instructions for expansion ratio.
     num_native_instructions = sum(1 for _ in func.instructions)
-    ir_counts = classify_il_function(mlil)
+    ir_ops_counts = classify_il_function_ops(mlil)
+    ir_ast_counts = classify_il_function_ast(mlil)
     native_counts = classify_native_instructions(func, bv)
-    return num_instructions, num_native_instructions, ir_counts, native_counts, text
+    return num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
 
 
 def run(binary_path, outdir, limit):
@@ -81,12 +86,13 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, n_native, ir_counts, native_counts, text = lift_function(func, bv)
+                        n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
                         for cat in CATEGORIES:
-                            record[f"ir_ops_{cat}"] = ir_counts[cat]
+                            record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
+                            record[f"ir_ast_{cat}"] = ir_ast_counts[cat]
                             record[f"native_{cat}"] = native_counts[cat]
                         whole_binary_chunks.append((func.start, text))
                     except Exception as e:

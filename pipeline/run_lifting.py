@@ -1,6 +1,6 @@
 """Orchestrator for phase 1 of the pipeline: list functions + lift binaries
 across multiple backends (pyghidra/P-code, r2pipe/ESIL, angr/VEX,
-Binary Ninja/LLIL+MLIL+HLIL, RetDec/LLVM IR).
+Binary Ninja/LLIL+MLIL+HLIL, RetDec/LLVM IR, IDA Pro/Hex-Rays microcode).
 
 Each (binary, backend) pair is run as its OWN subprocess, using the backend's
 standalone script under pipeline/backends/. This isolates crashes and JVM/
@@ -37,6 +37,7 @@ BACKENDS = {
     "binja_mlil": "pipeline.backends.binja_mlil_lift",
     "binja_hlil": "pipeline.backends.binja_hlil_lift",
     "retdec": "pipeline.backends.retdec_lift",
+    "ida": "pipeline.backends.ida_lift",
 }
 
 DEFAULT_PYTHON_CANDIDATES = [REPO_ROOT / "bin" / "python3", Path(sys.executable)]

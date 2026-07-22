@@ -142,12 +142,12 @@ def list_functions():
     return functions
 
 
-def _walk_operand(op, mcode_categories, ir_counts):
+def _walk_operand_ast(op, mcode_categories, ir_ast_counts):
     """Recurse into one mop_t (or mop_t-like: mcallarg_t/mop_addr_t share
     the same .t/.d/.f/.a/.pair interface) that may itself hold an embedded
-    sub-instruction, and return how many were counted.
+    sub-instruction.
 
-    mop_d wraps another minsn_t directly (see _walk_minsn's docstring);
+    mop_d wraps another minsn_t directly (see _walk_minsn_ast's docstring);
     mop_f (call info) can hold further embedded instructions in its own
     argument list; mop_a ("address of") wraps the operand it takes the
     address of; mop_p (a lo/hi register pair, e.g. a 64-bit value on a
@@ -157,38 +157,40 @@ def _walk_operand(op, mcode_categories, ir_counts):
     stack var, immediate, ...) is a true leaf -- nothing to recurse into.
     """
     if op.t == ida_hexrays.mop_d:
-        return _walk_minsn(op.d, mcode_categories, ir_counts)
-    if op.t == ida_hexrays.mop_f:
-        return sum(_walk_operand(arg, mcode_categories, ir_counts) for arg in op.f.args)
-    if op.t == ida_hexrays.mop_a:
-        return _walk_operand(op.a, mcode_categories, ir_counts)
-    if op.t == ida_hexrays.mop_p:
-        return (_walk_operand(op.pair.lop, mcode_categories, ir_counts)
-                + _walk_operand(op.pair.hop, mcode_categories, ir_counts))
-    return 0
+        _walk_minsn_ast(op.d, mcode_categories, ir_ast_counts)
+    elif op.t == ida_hexrays.mop_f:
+        for arg in op.f.args:
+            _walk_operand_ast(arg, mcode_categories, ir_ast_counts)
+    elif op.t == ida_hexrays.mop_a:
+        _walk_operand_ast(op.a, mcode_categories, ir_ast_counts)
+    elif op.t == ida_hexrays.mop_p:
+        _walk_operand_ast(op.pair.lop, mcode_categories, ir_ast_counts)
+        _walk_operand_ast(op.pair.hop, mcode_categories, ir_ast_counts)
 
 
-def _walk_minsn(insn, mcode_categories, ir_counts):
+def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts):
     """Classify one minsn_t by its own opcode, then recurse into its
-    operands for any embedded sub-instruction, and return the total number
-    of (sub-)instructions counted (including `insn` itself).
+    operands for any embedded sub-instruction -- the ast-granularity walk
+    (see classify_vex_statement_ast/classify_il_function_ast for the same
+    concept in angr_lift.py/binja_il_classify.py), kept alongside the flat
+    ops-granularity count in lift_function so expansion-ratio can be
+    reported at both, matching the rest of this project's nesting-capable
+    backends.
 
     Hex-Rays microcode often nests a call (or other instruction) as an
     operand of another instruction via mop_d instead of always emitting it
     as its own top-level minsn_t in the block -- e.g. `mov call $foo() =>
     result, ret` is ONE linked-list instruction textually, but two real
     micro-ops: the outer mov and the nested call. Classifying only the
-    outer opcode (as this used to do) silently folds the nested op into
-    whatever category the wrapping instruction falls into -- confirmed
-    against a real binary in this project's own corpus, where ~55% of all
-    call sub-instructions are embedded this way and were landing in
-    "other" instead of "control".
+    outer opcode (what the ops granularity does, by design) folds the
+    nested op into whatever category the wrapping instruction falls into
+    -- confirmed against a real binary in this project's own corpus, where
+    ~55% of all call sub-instructions are embedded this way and would
+    land in "other" instead of "control" if never walked at all.
     """
-    ir_counts[mcode_categories.get(insn.opcode, "other")] += 1
-    count = 1
+    ir_ast_counts[mcode_categories.get(insn.opcode, "other")] += 1
     for op in (insn.l, insn.r, insn.d):
-        count += _walk_operand(op, mcode_categories, ir_counts)
-    return count
+        _walk_operand_ast(op, mcode_categories, ir_ast_counts)
 
 
 def lift_function(f, mcode_categories, md, family):
@@ -201,7 +203,8 @@ def lift_function(f, mcode_categories, md, family):
     lines = [f"; ---- function {ida_funcs.get_func_name(f.start_ea)} @ {hex(f.start_ea)} ----"]
     total_ops = 0
     current_ea = None
-    ir_counts = {c: 0 for c in CATEGORIES}
+    ir_ops_counts = {c: 0 for c in CATEGORIES}
+    ir_ast_counts = {c: 0 for c in CATEGORIES}
     for i in range(mba.qty):
         insn = mba.get_mblock(i).head
         while insn:
@@ -209,7 +212,9 @@ def lift_function(f, mcode_categories, md, family):
                 lines.append(f"; 0x{insn.ea:x}")
                 current_ea = insn.ea
             lines.append(f"  {insn.dstr()}")
-            total_ops += _walk_minsn(insn, mcode_categories, ir_counts)
+            total_ops += 1
+            ir_ops_counts[mcode_categories.get(insn.opcode, "other")] += 1
+            _walk_minsn_ast(insn, mcode_categories, ir_ast_counts)
             insn = insn.next
 
     # Native disassembly instruction count over the function's own items
@@ -225,7 +230,7 @@ def lift_function(f, mcode_categories, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_counts, native_counts, text
+    return total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
 
 
 def run(binary_path, outdir, limit):
@@ -276,12 +281,15 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_ops, n_native, ir_counts, native_counts, text = lift_function(f, mcode_categories, md, family)
+                    n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(
+                        f, mcode_categories, md, family
+                    )
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
                     record["num_native_instructions"] = n_native
                     for cat in CATEGORIES:
-                        record[f"ir_ops_{cat}"] = ir_counts[cat]
+                        record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
+                        record[f"ir_ast_{cat}"] = ir_ast_counts[cat]
                         record[f"native_{cat}"] = native_counts[cat]
                     whole_binary_chunks.append((fea, text))
                 except Exception as e:

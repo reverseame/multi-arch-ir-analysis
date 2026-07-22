@@ -1,6 +1,6 @@
 """Orchestrator for phase 1 of the pipeline: list functions + lift binaries
 across multiple backends (pyghidra/P-code, r2pipe/ESIL, angr/VEX,
-Binary Ninja/LLIL+MLIL+HLIL, RetDec/LLVM IR).
+Binary Ninja/LLIL+MLIL+HLIL, RetDec/LLVM IR, IDA Pro/Hex-Rays microcode).
 
 Each (binary, backend) pair is run as its OWN subprocess, using the backend's
 standalone script under pipeline/backends/. This isolates crashes and JVM/
@@ -37,6 +37,7 @@ BACKENDS = {
     "binja_mlil": "pipeline.backends.binja_mlil_lift",
     "binja_hlil": "pipeline.backends.binja_hlil_lift",
     "retdec": "pipeline.backends.retdec_lift",
+    "ida": "pipeline.backends.ida_lift",
 }
 
 DEFAULT_PYTHON_CANDIDATES = [REPO_ROOT / "bin" / "python3", Path(sys.executable)]
@@ -146,7 +147,7 @@ def main():
     parser.add_argument("--opt", default=None,
                          help="Comma-separated optimization levels to include, parsed from the BinKit "
                               "filename (e.g. O0,O2). Default: all optimization levels")
-    parser.add_argument("--backends", default="pyghidra,r2,angr,binja_llil,binja_mlil,binja_hlil,retdec",
+    parser.add_argument("--backends", default="pyghidra,r2,angr,binja_llil,binja_mlil,binja_hlil,retdec,ida",
                          help=f"Comma-separated backend list (available: {', '.join(BACKENDS)})")
     parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "results",
                          help="Root output directory (default: ./results)")

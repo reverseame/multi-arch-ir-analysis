@@ -147,7 +147,7 @@ def main():
     parser.add_argument("--opt", default=None,
                          help="Comma-separated optimization levels to include, parsed from the BinKit "
                               "filename (e.g. O0,O2). Default: all optimization levels")
-    parser.add_argument("--backends", default="pyghidra,r2,angr,binja_llil,binja_mlil,binja_hlil,retdec",
+    parser.add_argument("--backends", default="pyghidra,r2,angr,binja_llil,binja_mlil,binja_hlil,retdec,ida",
                          help=f"Comma-separated backend list (available: {', '.join(BACKENDS)})")
     parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "results",
                          help="Root output directory (default: ./results)")

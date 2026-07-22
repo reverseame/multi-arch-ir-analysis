@@ -111,13 +111,17 @@ def ida_arch_key():
 
 
 def is_external_placeholder(f):
-    """True for functions with no real code to decompile: genuinely
-    external/library functions and thunks (FUNC_LIB/FUNC_THUNK), plus IDA's
-    synthetic entries for unresolved import targets, which live in a
-    dedicated "extern" segment (SEG_XTRN) of their own.
+    """True for functions with no real code to decompile: IDA's synthetic
+    entries for unresolved import targets, which live in a dedicated
+    "extern" segment (SEG_XTRN) of their own.
+
+    Deliberately NOT keyed off FUNC_THUNK: a real .plt trampoline is also
+    flagged FUNC_THUNK (it thunks to that placeholder) but has actual
+    instruction bytes in the binary's own .plt section, so FUNC_THUNK alone
+    would wrongly also skip those -- mirrors pyghidra_lift.py's
+    is_external_placeholder, which hits this exact pitfall with Ghidra's
+    isThunk() and checks segment/block membership instead.
     """
-    if f.flags & (ida_funcs.FUNC_LIB | ida_funcs.FUNC_THUNK):
-        return True
     seg = ida_segment.getseg(f.start_ea)
     return seg is not None and seg.type == ida_segment.SEG_XTRN
 
@@ -138,6 +142,55 @@ def list_functions():
     return functions
 
 
+def _walk_operand(op, mcode_categories, ir_counts):
+    """Recurse into one mop_t (or mop_t-like: mcallarg_t/mop_addr_t share
+    the same .t/.d/.f/.a/.pair interface) that may itself hold an embedded
+    sub-instruction, and return how many were counted.
+
+    mop_d wraps another minsn_t directly (see _walk_minsn's docstring);
+    mop_f (call info) can hold further embedded instructions in its own
+    argument list; mop_a ("address of") wraps the operand it takes the
+    address of; mop_p (a lo/hi register pair, e.g. a 64-bit value on a
+    32-bit target) wraps two further operands. Verified against this
+    project's own real binaries via a live idalib session that all four
+    occur and expose these attributes. Any other operand kind (register,
+    stack var, immediate, ...) is a true leaf -- nothing to recurse into.
+    """
+    if op.t == ida_hexrays.mop_d:
+        return _walk_minsn(op.d, mcode_categories, ir_counts)
+    if op.t == ida_hexrays.mop_f:
+        return sum(_walk_operand(arg, mcode_categories, ir_counts) for arg in op.f.args)
+    if op.t == ida_hexrays.mop_a:
+        return _walk_operand(op.a, mcode_categories, ir_counts)
+    if op.t == ida_hexrays.mop_p:
+        return (_walk_operand(op.pair.lop, mcode_categories, ir_counts)
+                + _walk_operand(op.pair.hop, mcode_categories, ir_counts))
+    return 0
+
+
+def _walk_minsn(insn, mcode_categories, ir_counts):
+    """Classify one minsn_t by its own opcode, then recurse into its
+    operands for any embedded sub-instruction, and return the total number
+    of (sub-)instructions counted (including `insn` itself).
+
+    Hex-Rays microcode often nests a call (or other instruction) as an
+    operand of another instruction via mop_d instead of always emitting it
+    as its own top-level minsn_t in the block -- e.g. `mov call $foo() =>
+    result, ret` is ONE linked-list instruction textually, but two real
+    micro-ops: the outer mov and the nested call. Classifying only the
+    outer opcode (as this used to do) silently folds the nested op into
+    whatever category the wrapping instruction falls into -- confirmed
+    against a real binary in this project's own corpus, where ~55% of all
+    call sub-instructions are embedded this way and were landing in
+    "other" instead of "control".
+    """
+    ir_counts[mcode_categories.get(insn.opcode, "other")] += 1
+    count = 1
+    for op in (insn.l, insn.r, insn.d):
+        count += _walk_operand(op, mcode_categories, ir_counts)
+    return count
+
+
 def lift_function(f, mcode_categories, md, family):
     hf = ida_hexrays.hexrays_failure_t()
     cfunc = ida_hexrays.decompile(f.start_ea, hf)
@@ -156,8 +209,7 @@ def lift_function(f, mcode_categories, md, family):
                 lines.append(f"; 0x{insn.ea:x}")
                 current_ea = insn.ea
             lines.append(f"  {insn.dstr()}")
-            total_ops += 1
-            ir_counts[mcode_categories.get(insn.opcode, "other")] += 1
+            total_ops += _walk_minsn(insn, mcode_categories, ir_counts)
             insn = insn.next
 
     # Native disassembly instruction count over the function's own items

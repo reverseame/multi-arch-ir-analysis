@@ -71,6 +71,7 @@ def lift_function(func, bv):
     # SSA-operations metric: llil.ssa_form is a cheap, already-computed
     # alternate view of this same function (BNGetLowLevelILSSAForm), not a
     # fresh analysis.
+    num_ssa_instructions = sum(1 for _ in llil.ssa_form.instructions)
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
         num_temp_vars, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,

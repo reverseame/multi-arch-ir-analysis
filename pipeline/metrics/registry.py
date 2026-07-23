@@ -1,7 +1,7 @@
 """Pluggable-block registry for metrics processing.
 
 Each metrics block (pipeline/metrics/blocks/*.py) computes ONE category from
-possible_metrics.txt (cost, verbosity, robustness, agnosticism, ...) over the
+possible_metrics.txt (cost, expansion_ratio, robustness, agnosticism, ...) over the
 lifting pipeline's results/ directory (manifest.json + per-run summary.json).
 A block registers itself with @register_block("name") at import time; call
 load_all_blocks() once (run_metrics.py does this at startup) to import every

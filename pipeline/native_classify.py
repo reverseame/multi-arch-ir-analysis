@@ -1,7 +1,7 @@
 """Shared native-instruction classifier: arithmetic / control / memory / other.
 
 Used by every backend's lift script so the *denominator* side of the
-per-category expansion ratio (see pipeline/metrics/blocks/verbosity.py) is
+per-category expansion ratio (see pipeline/metrics/blocks/expansion_ratio.py) is
 computed by one shared rule across all five backends, instead of one
 taxonomy per backend. Driven by capstone (already a transitive dependency
 via angr/pyvex -- see requirements.txt) rather than each tool's own notion

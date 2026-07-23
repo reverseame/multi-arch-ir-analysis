@@ -1,7 +1,7 @@
 """Orchestrator for phase 2 of the pipeline: metrics processing over the
 results/ directory produced by pipeline.run_lifting.
 
-Each metrics category (cost, verbosity, robustness, agnosticism, ...) is a
+Each metrics category (cost, expansion_ratio, robustness, agnosticism, ...) is a
 self-contained block under pipeline/metrics/blocks/ that registers itself
 with @register_block. This script only loads manifest.json plus each run's
 binary metadata, then hands the run list to whichever blocks were requested --

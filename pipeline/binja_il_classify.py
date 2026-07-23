@@ -12,7 +12,7 @@ after stripping the level's own prefix, covers all three levels instead of
 duplicating near-identical tables three times.
 
 Two classification granularities are provided, both used by expansion-ratio
-metrics (pipeline/metrics/blocks/verbosity.py):
+metrics (pipeline/metrics/blocks/expansion_ratio.py):
 
   - classify_il_function_ops: one label per top-level instruction only
     (`il_func.instructions`) -- the same counting unit as

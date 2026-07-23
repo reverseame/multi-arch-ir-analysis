@@ -1,7 +1,7 @@
 """Temporaries metrics block: how many temporary variables/registers each
 backend's IR introduces per native instruction, per (binary, backend,
 function). Not in possible_metrics.txt yet, but the same shape as the
-verbosity block's expansion ratio (IR count / native instruction count) --
+expansion_ratio block's expansion ratio (IR count / native instruction count) --
 just counting distinct temporaries instead of IR ops.
 
 Compound native instructions often get decomposed into several intermediate
@@ -39,7 +39,7 @@ lift_function for the exact extraction:
     opposed to a named "%some_var") in RetDec's textual .ll output --
     computed here at metrics time from whole_binary.ll, the same convention
     this project already uses for retdec's category counts (see
-    verbosity.py's module docstring for why: RetDec has no live session to
+    expansion_ratio.py's module docstring for why: RetDec has no live session to
     reuse, so parsing the on-disk .ll happens at metrics time instead of
     inside retdec_lift.py's Timer()-wrapped run).
   - Hex-Rays microcode (ida_lift.py): mop_l ("local variable") operands,
@@ -57,16 +57,16 @@ lift_function for the exact extraction:
     meaningful data point (ESIL genuinely has no notion of a named
     temporary), not a measurement gap.
 
-Only successful runs are counted, same convention as verbosity.py. A
+Only successful runs are counted, same convention as expansion_ratio.py. A
 function's row is skipped entirely if no ratio is computable (native
 instruction count missing or zero), not reported as a 0 -- matching
-verbosity.py's "no data" vs. "genuinely zero" distinction.
+expansion_ratio.py's "no data" vs. "genuinely zero" distinction.
 """
 
 from collections import defaultdict
 from pathlib import Path
 
-from pipeline.metrics.blocks.verbosity import _load_lift_records, _retdec_native_category_counts
+from pipeline.metrics.blocks.expansion_ratio import _load_lift_records, _retdec_native_category_counts
 from pipeline.metrics.formulas import aggregate_stats, expansion_ratio
 from pipeline.metrics.registry import register_block
 
@@ -80,7 +80,7 @@ def _retdec_temp_var_counts(outdir):
     own auto-numbered temporaries, as opposed to a named "%some_var")
     defined within that function's whole_binary.ll block. Reuses the same
     brace-depth per-function split retdec_lift.py's own split_ll_by_function
-    / verbosity.py's _retdec_ir_category_counts already use, since RetDec
+    / expansion_ratio.py's _retdec_ir_category_counts already use, since RetDec
     has no live session to reuse (see this module's docstring).
     """
     from pipeline.backends.retdec_lift import LL_DEFINE_RE

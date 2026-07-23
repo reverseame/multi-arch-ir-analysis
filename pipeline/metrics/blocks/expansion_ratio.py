@@ -1,4 +1,4 @@
-"""Verbosity metrics block: IR-size expansion ratio, per (binary, backend,
+"""Expansion ratio metrics block: IR-size expansion ratio, per (binary, backend,
 function), from possible_metrics.txt's "IR-size expansion ratio". Reports
 two independent axes side by side:
 
@@ -320,7 +320,7 @@ def _total(counts):
     return sum(values)
 
 
-@register_block("verbosity")
+@register_block("expansion_ratio")
 def compute(runs, results_dir):
     completed = [r for r in runs if r.get("status") == "ok" and r["backend"] in IR_SIZE_FIELDS]
 
@@ -405,7 +405,7 @@ def compute(runs, results_dir):
             rows.append(row)
 
     return {
-        "block": "verbosity",
+        "block": "expansion_ratio",
         "num_runs_ok": len(completed),
         "num_runs_total": len(runs),
         "num_functions_evaluated": len(rows),

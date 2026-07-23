@@ -16,7 +16,7 @@ Direction of each metric (see possible_metrics.txt for definitions):
 import math
 import statistics
 
-# Verbosity block
+# Expansion ratio block
 def expansion_ratio(ir_size, native_instruction_count):
     """IR-size expansion ratio: ir_size / native_instruction_count, e.g. IR
     ops (or lines) per native instruction for one lifted function.

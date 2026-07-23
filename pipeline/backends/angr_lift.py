@@ -125,6 +125,24 @@ def classify_vex_statement_ast(stmt):
     return labels
 
 
+def vex_node_depth(node):
+    """How many levels deep node's own expression tree nests -- 1 for a
+    leaf/flat node with no nested IRExpr-valued slot, +1 for each level of
+    embedded sub-expression (e.g. "t5 = Add32(t1,t2)" is depth 2: the WrTmp
+    statement's own node, plus the Add32 nested inside it).
+    """
+    max_child_depth = 0
+    for slot in node.__slots__:
+        value = getattr(node, slot)
+        if isinstance(value, pyvex.expr.IRExpr):
+            max_child_depth = max(max_child_depth, vex_node_depth(value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, pyvex.expr.IRExpr):
+                    max_child_depth = max(max_child_depth, vex_node_depth(item))
+    return 1 + max_child_depth
+
+
 def list_functions(cfg):
     functions = []
     for func in cfg.kb.functions.values():
@@ -145,6 +163,8 @@ def lift_function(proj, func, cs_arch, family):
     total_statements = 0
     total_native_instructions = 0
     total_vex_temps = 0
+    max_nesting_depth = 0
+    sum_nesting_depth = 0
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
@@ -162,6 +182,13 @@ def lift_function(proj, func, cs_arch, family):
             ir_ops_counts[classify_vex_statement_ops(stmt)] += 1
             for label in classify_vex_statement_ast(stmt):
                 ir_ast_counts[label] += 1
+            # Nesting-depth metric: how deep this one statement's own
+            # expression tree goes, summed/maxed across the function so the
+            # metrics block can report both a typical (mean) and worst-case
+            # (max) depth per function.
+            depth = vex_node_depth(stmt)
+            max_nesting_depth = max(max_nesting_depth, depth)
+            sum_nesting_depth += depth
         lines.append(f"  NEXT: {irsb.next} ; jumpkind={irsb.jumpkind}")
         lines.append("")
         total_statements += len(irsb.statements)
@@ -186,7 +213,10 @@ def lift_function(proj, func, cs_arch, family):
                 native_counts[classify_insn(wrapped.insn, cs_arch, family)] += 1
 
     text = "\n".join(lines)
-    return total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, total_vex_temps, text
+    return (
+        total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
+        total_vex_temps, max_nesting_depth, sum_nesting_depth, text,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -226,13 +256,16 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(
-                        proj, func, cs_arch, family
-                    )
+                    (
+                        n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts,
+                        n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                    ) = lift_function(proj, func, cs_arch, family)
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
                     record["num_native_instructions"] = n_native
                     record["num_temp_vars"] = n_temp_vars
+                    record["max_nesting_depth"] = max_nesting_depth
+                    record["sum_nesting_depth"] = sum_nesting_depth
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

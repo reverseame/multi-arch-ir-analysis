@@ -210,6 +210,36 @@ def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids):
         _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids)
 
 
+def _mcode_operand_depth(op):
+    """How many extra levels of nesting `op` itself contributes -- 0 for a
+    true leaf (register, stack var, immediate, mop_l, ...), or the depth of
+    whatever it wraps otherwise. Same four recursable operand kinds as
+    _walk_operand_ast (mop_d/mop_f/mop_a/mop_p), just returning a depth
+    instead of accumulating into ir_ast_counts/temp_var_ids -- kept as its
+    own separate walk rather than fused into _walk_operand_ast since depth
+    is a return value threaded bottom-up, not a side-effecting accumulator
+    like the existing counters.
+    """
+    if op.t == ida_hexrays.mop_d:
+        return _mcode_insn_depth(op.d)
+    if op.t == ida_hexrays.mop_f:
+        return max((_mcode_operand_depth(arg) for arg in op.f.args), default=0)
+    if op.t == ida_hexrays.mop_a:
+        return _mcode_operand_depth(op.a)
+    if op.t == ida_hexrays.mop_p:
+        return max(_mcode_operand_depth(op.pair.lop), _mcode_operand_depth(op.pair.hop))
+    return 0
+
+
+def _mcode_insn_depth(insn):
+    """How many levels deep `insn`'s own operand tree nests -- 1 for a
+    leaf/flat instruction with no embedded sub-instruction, +1 for each
+    level mop_d/mop_f/mop_a/mop_p wraps further (e.g. a call whose argument
+    is itself a computed address, `mov call $foo(addr_expr) => result`).
+    """
+    return 1 + max((_mcode_operand_depth(op) for op in (insn.l, insn.r, insn.d)), default=0)
+
+
 def lift_function(f, mcode_categories, md, family):
     hf = ida_hexrays.hexrays_failure_t()
     cfunc = ida_hexrays.decompile(f.start_ea, hf)
@@ -223,6 +253,8 @@ def lift_function(f, mcode_categories, md, family):
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
     temp_var_ids = set()
+    max_nesting_depth = 0
+    sum_nesting_depth = 0
     for i in range(mba.qty):
         insn = mba.get_mblock(i).head
         while insn:
@@ -233,6 +265,11 @@ def lift_function(f, mcode_categories, md, family):
             total_ops += 1
             ir_ops_counts[mcode_categories.get(insn.opcode, "other")] += 1
             _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+            # Nesting-depth metric: how deep this one instruction's own
+            # operand tree goes (see _mcode_insn_depth).
+            depth = _mcode_insn_depth(insn)
+            max_nesting_depth = max(max_nesting_depth, depth)
+            sum_nesting_depth += depth
             insn = insn.next
     num_temp_vars = len(temp_var_ids)
 
@@ -249,7 +286,10 @@ def lift_function(f, mcode_categories, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, num_temp_vars, text
+    return (
+        total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
+        num_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -300,13 +340,16 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(
-                        f, mcode_categories, md, family
-                    )
+                    (
+                        n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts,
+                        n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                    ) = lift_function(f, mcode_categories, md, family)
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
                     record["num_native_instructions"] = n_native
                     record["num_temp_vars"] = n_temp_vars
+                    record["max_nesting_depth"] = max_nesting_depth
+                    record["sum_nesting_depth"] = sum_nesting_depth
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

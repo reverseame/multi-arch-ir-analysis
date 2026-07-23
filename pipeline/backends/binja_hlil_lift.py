@@ -21,6 +21,7 @@ from pipeline.common import (
     write_whole_binary_dump,
 )
 from pipeline.binja_il_classify import (
+    bnil_instruction_depth,
     classify_il_function_ast,
     classify_il_function_ops,
     classify_native_instructions,
@@ -49,9 +50,17 @@ def lift_function(func, bv):
     hlil = func.hlil
     lines = [f"; ---- function {func.name} @ {hex(func.start)} ----"]
     num_instructions = 0
+    max_nesting_depth = 0
+    sum_nesting_depth = 0
     for insn in hlil.instructions:
         lines.append(f"  0x{insn.address:x}  {insn}")
         num_instructions += 1
+        # Nesting-depth metric: how deep this one instruction's own
+        # expression tree goes (see binja_il_classify.bnil_instruction_depth).
+        # HLIL is where this is most informative.
+        depth = bnil_instruction_depth(insn)
+        max_nesting_depth = max(max_nesting_depth, depth)
+        sum_nesting_depth += depth
     text = "\n".join(lines)
     # func.instructions for expansion ratio.
     num_native_instructions = sum(1 for _ in func.instructions)
@@ -63,7 +72,10 @@ def lift_function(func, bv):
     # and often zero, since HLIL's expression-inlining eliminates most
     # surviving MLIL temps.
     num_temp_vars = sum(1 for v in hlil.vars if is_bnil_temp_var(v))
-    return num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, num_temp_vars, text
+    return (
+        num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
+        num_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -92,11 +104,16 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(func, bv)
+                        (
+                            n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
+                            n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                        ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_hlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
                         record["num_temp_vars"] = n_temp_vars
+                        record["max_nesting_depth"] = max_nesting_depth
+                        record["sum_nesting_depth"] = sum_nesting_depth
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

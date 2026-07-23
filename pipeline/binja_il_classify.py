@@ -175,6 +175,38 @@ def classify_il_function_ast(il_func):
     return counts
 
 
+# Structural (nested statement *block*) operand names, not expression
+# operands -- matches HighLevelILInstruction.traverse()'s own default
+# (shallow=True) blacklist (see binaryninja/highlevelil.py). Only relevant
+# for HLIL, which has structured control flow (WHILE/DO_WHILE/FOR/SWITCH/
+# IF-as-block); LLIL/MLIL's IF/GOTO targets are plain basic-block-index
+# ints, never nested instruction lists, so this is a no-op for them.
+# Without this, a HLIL_WHILE's "body" operand (its entire loop body, often
+# dozens of unrelated statements) would count as expression nesting inside
+# the while-statement's own depth.
+_STRUCTURAL_OPERAND_NAMES = {"true", "false", "body", "cases", "default"}
+
+
+def bnil_instruction_depth(instr):
+    """How many levels deep `instr`'s own expression tree nests -- 1 for a
+    leaf/flat instruction with no nested instruction-valued operand, +1 for
+    each level of embedded sub-expression (e.g. "eax = 4" is depth 1, "eax =
+    ebx + 4" is depth 2: the SET_REG/SET_VAR/VAR_INIT's own node plus the
+    ADD nested inside it).
+    """
+    max_child_depth = 0
+    for name, op, _ in instr.detailed_operands:
+        if name in _STRUCTURAL_OPERAND_NAMES:
+            continue
+        if hasattr(op, "detailed_operands"):
+            max_child_depth = max(max_child_depth, bnil_instruction_depth(op))
+        elif isinstance(op, list):
+            for item in op:
+                if hasattr(item, "detailed_operands"):
+                    max_child_depth = max(max_child_depth, bnil_instruction_depth(item))
+    return 1 + max_child_depth
+
+
 # --- native-instruction classification (shared with the other 4 backends
 # via pipeline/native_classify.py) --------------------------------------
 

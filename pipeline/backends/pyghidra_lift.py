@@ -178,6 +178,7 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
     total_ops = 0
     current_addr = None
     ir_counts = {c: 0 for c in CATEGORIES}
+    num_temp_vars = 0
     op_iter = high_func.getPcodeOps()
     while op_iter.hasNext():
         op = op_iter.next()
@@ -188,6 +189,16 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
         lines.append(f"  {pcodeop_high_str(op, language)}")
         total_ops += 1
         ir_counts[classify_pcode_op(op.getMnemonic())] += 1
+        # Temporaries metric: count at *definition* time rather than
+        # deduping by the unique-space varnode's raw offset -- that offset
+        # is reused across many genuinely distinct temporaries within the
+        # same function, so a set() keyed by offset would drastically
+        # undercount. Ghidra's SSA property guarantees each unique-space
+        # value has exactly one defining PcodeOp, so counting definitions is
+        # both simpler and exact.
+        out = op.getOutput()
+        if out is not None and out.isUnique():
+            num_temp_vars += 1
 
     # Native disassembly instruction count over the function's own address
     # range for obtaining expansion ratio.
@@ -202,7 +213,7 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_counts, native_counts, text
+    return total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, text
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -274,12 +285,13 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, n_native, ir_counts, native_counts, text = lift_function(
+                                n_ops, n_native, ir_counts, native_counts, n_temp_vars, text = lift_function(
                                     ifc, func, language, monitor, decomp_timeout_s, listing, md, family
                                 )
                                 record["status"] = "ok"
                                 record["num_pcode_ops"] = n_ops
                                 record["num_native_instructions"] = n_native
+                                record["num_temp_vars"] = n_temp_vars
                                 for cat in CATEGORIES:
                                     record[f"ir_ops_{cat}"] = ir_counts[cat]
                                     record[f"native_{cat}"] = native_counts[cat]

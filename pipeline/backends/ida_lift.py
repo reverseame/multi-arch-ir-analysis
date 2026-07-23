@@ -142,10 +142,11 @@ def list_functions():
     return functions
 
 
-def _walk_operand_ast(op, mcode_categories, ir_ast_counts):
+def _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids):
     """Recurse into one mop_t (or mop_t-like: mcallarg_t/mop_addr_t share
     the same .t/.d/.f/.a/.pair interface) that may itself hold an embedded
-    sub-instruction.
+    sub-instruction, and record any mop_l ("local variable") operand along
+    the way for the temporaries metric.
 
     mop_d wraps another minsn_t directly (see _walk_minsn_ast's docstring);
     mop_f (call info) can hold further embedded instructions in its own
@@ -154,28 +155,44 @@ def _walk_operand_ast(op, mcode_categories, ir_ast_counts):
     32-bit target) wraps two further operands. Verified against this
     project's own real binaries via a live idalib session that all four
     occur and expose these attributes. Any other operand kind (register,
-    stack var, immediate, ...) is a true leaf -- nothing to recurse into.
+    stack var, immediate, ...) is a true leaf -- nothing to recurse into,
+    except mop_l which is itself the thing being counted.
+
+    mop_l's index (`op.l.idx`, into `mba.vars`) is filtered to exclude real
+    arguments (`lvar.is_arg_var`) and real named/debug-recovered locals
+    (`lvar.has_user_name`) before being added to `temp_var_ids` -- confirmed
+    against a real decompiled `main()` in this project's own corpus that
+    once Hex-Rays reaches its final SSA form, *every* local becomes a mop_l
+    operand (17 mop_l vars total there, only 8 of which were actually
+    unnamed/synthetic: argc/argv and 6 debug-recovered names like `found`,
+    `n_files`, `i` were also mop_l). Counting all mop_l without this filter
+    would measure "how many locals exist" more than "how much unsugaring
+    happened" -- see pipeline/metrics/blocks/temporaries.py.
     """
     if op.t == ida_hexrays.mop_d:
-        _walk_minsn_ast(op.d, mcode_categories, ir_ast_counts)
+        _walk_minsn_ast(op.d, mcode_categories, ir_ast_counts, mba, temp_var_ids)
     elif op.t == ida_hexrays.mop_f:
         for arg in op.f.args:
-            _walk_operand_ast(arg, mcode_categories, ir_ast_counts)
+            _walk_operand_ast(arg, mcode_categories, ir_ast_counts, mba, temp_var_ids)
     elif op.t == ida_hexrays.mop_a:
-        _walk_operand_ast(op.a, mcode_categories, ir_ast_counts)
+        _walk_operand_ast(op.a, mcode_categories, ir_ast_counts, mba, temp_var_ids)
     elif op.t == ida_hexrays.mop_p:
-        _walk_operand_ast(op.pair.lop, mcode_categories, ir_ast_counts)
-        _walk_operand_ast(op.pair.hop, mcode_categories, ir_ast_counts)
+        _walk_operand_ast(op.pair.lop, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+        _walk_operand_ast(op.pair.hop, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+    elif op.t == ida_hexrays.mop_l:
+        lvar = mba.vars[op.l.idx]
+        if not lvar.is_arg_var and not lvar.has_user_name:
+            temp_var_ids.add(op.l.idx)
 
 
-def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts):
+def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids):
     """Classify one minsn_t by its own opcode, then recurse into its
     operands for any embedded sub-instruction -- the ast-granularity walk
     (see classify_vex_statement_ast/classify_il_function_ast for the same
     concept in angr_lift.py/binja_il_classify.py), kept alongside the flat
     ops-granularity count in lift_function so expansion-ratio can be
     reported at both, matching the rest of this project's nesting-capable
-    backends.
+    backends. Also feeds the temporaries metric (see _walk_operand_ast).
 
     Hex-Rays microcode often nests a call (or other instruction) as an
     operand of another instruction via mop_d instead of always emitting it
@@ -190,7 +207,7 @@ def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts):
     """
     ir_ast_counts[mcode_categories.get(insn.opcode, "other")] += 1
     for op in (insn.l, insn.r, insn.d):
-        _walk_operand_ast(op, mcode_categories, ir_ast_counts)
+        _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids)
 
 
 def lift_function(f, mcode_categories, md, family):
@@ -205,6 +222,7 @@ def lift_function(f, mcode_categories, md, family):
     current_ea = None
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
+    temp_var_ids = set()
     for i in range(mba.qty):
         insn = mba.get_mblock(i).head
         while insn:
@@ -214,8 +232,9 @@ def lift_function(f, mcode_categories, md, family):
             lines.append(f"  {insn.dstr()}")
             total_ops += 1
             ir_ops_counts[mcode_categories.get(insn.opcode, "other")] += 1
-            _walk_minsn_ast(insn, mcode_categories, ir_ast_counts)
+            _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids)
             insn = insn.next
+    num_temp_vars = len(temp_var_ids)
 
     # Native disassembly instruction count over the function's own items
     native_counts = {c: 0 for c in CATEGORIES}
@@ -230,7 +249,7 @@ def lift_function(f, mcode_categories, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
+    return total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, num_temp_vars, text
 
 
 def run(binary_path, outdir, limit):
@@ -281,12 +300,13 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(
+                    n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(
                         f, mcode_categories, md, family
                     )
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
                     record["num_native_instructions"] = n_native
+                    record["num_temp_vars"] = n_temp_vars
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

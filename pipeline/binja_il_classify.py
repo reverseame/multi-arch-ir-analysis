@@ -41,7 +41,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from binaryninja import VariableSourceType
+
 from pipeline.native_classify import arch_family, classify_bytes, cs_arch_for, make_disassembler
+
+# LLIL temp registers/flags are encoded with their high bit set (see
+# binaryninja.lowlevelil.ILRegister.temp/ILFlag.temp); MLIL/HLIL have no
+# temp_reg_count-style helper of their own, but Binary Ninja promotes an
+# unresolved LLIL temp into a full Variable that keeps that same encoding in
+# its .storage field so MLIL/HLIL temps are detected via that bit
+# instead of a level-specific API.
+_TEMP_STORAGE_BIT = 0x80000000
+
+
+def is_bnil_temp_var(v):
+    """True if MLIL/HLIL Variable `v` is Binary Ninja's promoted form of an
+    unresolved LLIL temp register (temp#N), not a real named/recovered local
+    or parameter. See module-level comment above for how this is encoded.
+    """
+    return v.source_type == VariableSourceType.RegisterVariableSourceType and bool(v.storage & _TEMP_STORAGE_BIT)
 
 _ARITH_SUFFIXES = {
     "ADD", "ADC", "SUB", "SBB",

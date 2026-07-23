@@ -24,6 +24,7 @@ from pipeline.binja_il_classify import (
     classify_il_function_ast,
     classify_il_function_ops,
     classify_native_instructions,
+    is_bnil_temp_var,
 )
 
 from binaryninja import load
@@ -57,7 +58,11 @@ def lift_function(func, bv):
     ir_ops_counts = classify_il_function_ops(mlil)
     ir_ast_counts = classify_il_function_ast(mlil)
     native_counts = classify_native_instructions(func, bv)
-    return num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
+    # Temporaries metric: MLIL has no temp_reg_count-style helper of its own
+    # (unlike LLIL) -- an unresolved LLIL temp survives into MLIL as a full
+    # Variable that keeps the same high-bit encoding (see
+    num_temp_vars = sum(1 for v in mlil.vars if is_bnil_temp_var(v))
+    return num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, num_temp_vars, text
 
 
 def run(binary_path, outdir, limit):
@@ -86,10 +91,11 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(func, bv)
+                        n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
+                        record["num_temp_vars"] = n_temp_vars
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

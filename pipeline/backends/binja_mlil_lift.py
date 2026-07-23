@@ -70,9 +70,13 @@ def lift_function(func, bv):
     # (unlike LLIL) -- an unresolved LLIL temp survives into MLIL as a full
     # Variable that keeps the same high-bit encoding (see
     num_temp_vars = sum(1 for v in mlil.vars if is_bnil_temp_var(v))
+    # SSA-operations metric: mlil.ssa_form is a cheap, already-computed
+    # alternate view of this same function.
+    mlil_ssa = mlil.ssa_form
+    num_ssa_instructions = sum(1 for _ in mlil_ssa.instructions) if mlil_ssa is not None else None
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+        num_temp_vars, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,
     )
 
 
@@ -104,7 +108,7 @@ def run(binary_path, outdir, limit):
                     try:
                         (
                             n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                            n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                            n_temp_vars, max_nesting_depth, sum_nesting_depth, n_ssa_instr, text,
                         ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
@@ -112,6 +116,7 @@ def run(binary_path, outdir, limit):
                         record["num_temp_vars"] = n_temp_vars
                         record["max_nesting_depth"] = max_nesting_depth
                         record["sum_nesting_depth"] = sum_nesting_depth
+                        record["num_ssa_instructions"] = n_ssa_instr
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

@@ -68,9 +68,12 @@ def lift_function(func, bv):
     # Temporaries metric: LLIL exposes exact built-in counts for its own
     # temp registers/flags, no manual walk needed.
     num_temp_vars = llil.temp_reg_count + llil.temp_flag_count
+    # SSA-operations metric: llil.ssa_form is a cheap, already-computed
+    # alternate view of this same function (BNGetLowLevelILSSAForm), not a
+    # fresh analysis.
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+        num_temp_vars, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,
     )
 
 
@@ -102,7 +105,7 @@ def run(binary_path, outdir, limit):
                     try:
                         (
                             n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                            n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                            n_temp_vars, max_nesting_depth, sum_nesting_depth, n_ssa_instr, text,
                         ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_llil_instructions"] = n_instr
@@ -110,6 +113,7 @@ def run(binary_path, outdir, limit):
                         record["num_temp_vars"] = n_temp_vars
                         record["max_nesting_depth"] = max_nesting_depth
                         record["sum_nesting_depth"] = sum_nesting_depth
+                        record["num_ssa_instructions"] = n_ssa_instr
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

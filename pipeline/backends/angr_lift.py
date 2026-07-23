@@ -144,12 +144,18 @@ def lift_function(proj, func, cs_arch, family):
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
     total_native_instructions = 0
+    total_vex_temps = 0
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
     for block in func.blocks:
         data = proj.loader.memory.load(block.addr, block.size)
         irsb = pyvex.lift(data, block.addr, proj.arch)
+        # Temporaries metric: pyvex's own per-IRSB temp count. IRTemp
+        # numbering (t0, t1, ...) is local to each basic block, not global to
+        # the function, so this is summed across blocks rather than deduped
+        # into one set
+        total_vex_temps += len(irsb.tyenv.types)
         lines.append(f"; ---- block 0x{block.addr:x} (size={block.size}) ----")
         for stmt in irsb.statements:
             lines.append(f"  {stmt}")
@@ -180,7 +186,7 @@ def lift_function(proj, func, cs_arch, family):
                 native_counts[classify_insn(wrapped.insn, cs_arch, family)] += 1
 
     text = "\n".join(lines)
-    return total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
+    return total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, total_vex_temps, text
 
 
 def run(binary_path, outdir, limit):
@@ -220,12 +226,13 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(
+                    n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts, n_temp_vars, text = lift_function(
                         proj, func, cs_arch, family
                     )
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
                     record["num_native_instructions"] = n_native
+                    record["num_temp_vars"] = n_temp_vars
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

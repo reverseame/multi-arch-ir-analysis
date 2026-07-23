@@ -188,7 +188,15 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
 
     num_esil_ops = sum(ir_counts.values())
     text = "\n".join(lines)
-    return len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, text
+    # Temporaries metric: always 0 by design -- ESIL is a stack-based
+    # representation (an RPN expression per instruction) with no operator
+    # that declares a named temporary, confirmed against radare2's own
+    # `ae???` operator table (every operator is a stack math/compare/memory/
+    # control op, none of them a temp declaration). A meaningful data point
+    # in its own right (ESIL genuinely has no notion of a named temporary),
+    # not a measurement gap -- see pipeline/metrics/blocks/temporaries.py.
+    num_temp_vars = 0
+    return len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, num_temp_vars, text
 
 
 def run(binary_path, outdir, limit):
@@ -235,13 +243,14 @@ def run(binary_path, outdir, limit):
                     record = {"function": func["name"], "address": func["address"]}
                     try:
                         md = disassembler_for(func.get("bits"))
-                        n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, text = lift_function(
+                        n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, n_temp_vars, text = lift_function(
                             r2, addr, func["name"], esil_operators, md, family, pc_register
                         )
                         record["status"] = "ok"
                         record["num_native_instructions"] = n_native
                         record["num_esil_ops"] = n_esil_ops
                         record["num_uncovered"] = n_uncovered
+                        record["num_temp_vars"] = n_temp_vars
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_counts[cat]
                             record[f"native_{cat}"] = native_counts[cat]

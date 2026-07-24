@@ -23,6 +23,7 @@ from pipeline.common import (
 from pipeline.binja_il_classify import (
     bnil_instruction_depth,
     classify_il_function_ast,
+    classify_il_function_escape,
     classify_il_function_ops,
     classify_native_instructions,
     is_bnil_temp_var,
@@ -70,13 +71,16 @@ def lift_function(func, bv):
     # (unlike LLIL) -- an unresolved LLIL temp survives into MLIL as a full
     # Variable that keeps the same high-bit encoding (see
     num_temp_vars = sum(1 for v in mlil.vars if is_bnil_temp_var(v))
+    # Escape-valve metric: see pipeline/binja_il_classify.py's
+    # classify_il_function_escape / pipeline/metrics/blocks/robustness.py.
+    num_escape_ops = classify_il_function_escape(mlil)
     # SSA-operations metric: mlil.ssa_form is a cheap, already-computed
     # alternate view of this same function.
     mlil_ssa = mlil.ssa_form
     num_ssa_instructions = sum(1 for _ in mlil_ssa.instructions) if mlil_ssa is not None else None
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,
+        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,
     )
 
 
@@ -108,12 +112,13 @@ def run(binary_path, outdir, limit):
                     try:
                         (
                             n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                            n_temp_vars, max_nesting_depth, sum_nesting_depth, n_ssa_instr, text,
+                            n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, n_ssa_instr, text,
                         ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
                         record["num_temp_vars"] = n_temp_vars
+                        record["num_escape_ops"] = n_escape_ops
                         record["max_nesting_depth"] = max_nesting_depth
                         record["sum_nesting_depth"] = sum_nesting_depth
                         record["num_ssa_instructions"] = n_ssa_instr

@@ -142,6 +142,17 @@ def list_functions():
     return functions
 
 
+def _insn_is_escape(insn):
+    """True if any of `insn`'s top-level operands (l, r, d) is mop_h --
+    Hex-Rays' own escape valve for semantics microcode can't express as a
+    primitive opcode: the instruction becomes a call whose target is a named
+    runtime helper function (e.g. `__memcpy`, `__CFSHL_4`) rather than a real
+    address or intrinsic microcode op. The closest Hex-Rays analog to
+    P-code's CALLOTHER / VEX's Ist_Dirty / BNIL's INTRINSIC.
+    """
+    return any(op.t == ida_hexrays.mop_h for op in (insn.l, insn.r, insn.d))
+
+
 def _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids):
     """Recurse into one mop_t (or mop_t-like: mcallarg_t/mop_addr_t share
     the same .t/.d/.f/.a/.pair interface) that may itself hold an embedded
@@ -253,6 +264,7 @@ def lift_function(f, mcode_categories, md, family):
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
     temp_var_ids = set()
+    num_escape_ops = 0
     max_nesting_depth = 0
     sum_nesting_depth = 0
     for i in range(mba.qty):
@@ -264,6 +276,8 @@ def lift_function(f, mcode_categories, md, family):
             lines.append(f"  {insn.dstr()}")
             total_ops += 1
             ir_ops_counts[mcode_categories.get(insn.opcode, "other")] += 1
+            if _insn_is_escape(insn):
+                num_escape_ops += 1
             _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids)
             # Nesting-depth metric: how deep this one instruction's own
             # operand tree goes (see _mcode_insn_depth).
@@ -288,7 +302,7 @@ def lift_function(f, mcode_categories, md, family):
     text = "\n".join(lines)
     return (
         total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, text,
     )
 
 
@@ -342,12 +356,13 @@ def run(binary_path, outdir, limit):
                 try:
                     (
                         n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                        n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                        n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, text,
                     ) = lift_function(f, mcode_categories, md, family)
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
                     record["num_native_instructions"] = n_native
                     record["num_temp_vars"] = n_temp_vars
+                    record["num_escape_ops"] = n_escape_ops
                     record["max_nesting_depth"] = max_nesting_depth
                     record["sum_nesting_depth"] = sum_nesting_depth
                     for cat in CATEGORIES:

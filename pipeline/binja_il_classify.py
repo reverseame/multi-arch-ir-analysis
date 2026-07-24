@@ -112,6 +112,14 @@ _ASSIGN_SUFFIXES = {
     "ASSIGN", "ASSIGN_UNPACK",
 }
 
+# Escape-valve metric: INTRINSIC is BNIL's own generic fallback for
+# instructions Binary Ninja's own IL can't express as primitive operations
+# and instead models as an opaque call to a named architecture-specific
+# intrinsic (e.g. x86 CPUID, ARM NEON/coprocessor ops) -- the closest BNIL
+# analog to P-code's CALLOTHER / VEX's Ist_Dirty. See
+# pipeline/metrics/blocks/robustness.py's escape_fraction.
+_ESCAPE_SUFFIXES = {"INTRINSIC", "INTRINSIC_SSA", "MEMORY_INTRINSIC_SSA", "MEMORY_INTRINSIC_OUTPUT_SSA"}
+
 _LEVEL_PREFIXES = ("LLIL_", "MLIL_", "HLIL_")
 
 
@@ -149,6 +157,28 @@ def classify_il_instruction_ops(instr):
     if suffix in _ASSIGN_SUFFIXES:
         return classify_il_operation(instr.src.operation.name)
     return classify_il_operation(instr.operation.name)
+
+
+def is_il_instruction_escape(instr):
+    """One top-level IL instruction -> True if it's (or wraps, via the same
+    assign-inheritance as classify_il_instruction_ops) BNIL's INTRINSIC
+    escape-valve operation -- e.g. `var = __intrinsic(...)` is one
+    LLIL_SET_REG instruction wrapping a nested LLIL_INTRINSIC, the same
+    inheritance classify_il_instruction_ops already applies for arithmetic/
+    control/memory.
+    """
+    suffix = _il_suffix(instr.operation.name)
+    if suffix in _ASSIGN_SUFFIXES:
+        suffix = _il_suffix(instr.src.operation.name)
+    return suffix in _ESCAPE_SUFFIXES
+
+
+def classify_il_function_escape(il_func):
+    """Count of top-level instructions in `il_func` that are BNIL's
+    INTRINSIC escape valve -- the ops-level granularity, same counting unit
+    as num_{llil,mlil,hlil}_instructions (see classify_il_function_ops).
+    """
+    return sum(1 for instr in il_func.instructions if is_il_instruction_escape(instr))
 
 
 def classify_il_function_ops(il_func):

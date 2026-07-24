@@ -163,6 +163,7 @@ def lift_function(proj, func, cs_arch, family):
     total_statements = 0
     total_native_instructions = 0
     total_vex_temps = 0
+    num_escape_ops = 0
     max_nesting_depth = 0
     sum_nesting_depth = 0
     ir_ops_counts = {c: 0 for c in CATEGORIES}
@@ -182,6 +183,12 @@ def lift_function(proj, func, cs_arch, family):
             ir_ops_counts[classify_vex_statement_ops(stmt)] += 1
             for label in classify_vex_statement_ast(stmt):
                 ir_ast_counts[label] += 1
+            # Escape-valve metric: Ist_Dirty is VEX's own generic fallback for
+            # instructions libVEX can't express as primitive IR and instead
+            # models as an opaque call to a "dirty helper" C function (e.g.
+            # x86 CPUID/string ops, ARM NEON)
+            if stmt.tag == "Ist_Dirty":
+                num_escape_ops += 1
             # Nesting-depth metric: how deep this one statement's own
             # expression tree goes, summed/maxed across the function so the
             # metrics block can report both a typical (mean) and worst-case
@@ -215,7 +222,7 @@ def lift_function(proj, func, cs_arch, family):
     text = "\n".join(lines)
     return (
         total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        total_vex_temps, max_nesting_depth, sum_nesting_depth, text,
+        total_vex_temps, num_escape_ops, max_nesting_depth, sum_nesting_depth, text,
     )
 
 
@@ -258,12 +265,13 @@ def run(binary_path, outdir, limit):
                 try:
                     (
                         n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                        n_temp_vars, max_nesting_depth, sum_nesting_depth, text,
+                        n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, text,
                     ) = lift_function(proj, func, cs_arch, family)
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
                     record["num_native_instructions"] = n_native
                     record["num_temp_vars"] = n_temp_vars
+                    record["num_escape_ops"] = n_escape_ops
                     record["max_nesting_depth"] = max_nesting_depth
                     record["sum_nesting_depth"] = sum_nesting_depth
                     for cat in CATEGORIES:

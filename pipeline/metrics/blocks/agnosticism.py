@@ -8,11 +8,13 @@ IR-size coefficient of variation, and cyclomatic complexity delta are
 planned follow-ups in this same file, added one at a time the way
 robustness.py's error_rate_by_category/escape_fraction were.
 
-Only binja_llil/binja_mlil/binja_hlil currently record a per-function
-op_histogram field (added alongside this block, see each binja_*_lift.py's
-lift_function) -- the other 5 backends get the same instrumentation in a
-later pass, following this project's usual one-backend-at-a-time rollout
-for a new metrics category.
+All 8 backends are covered. binja_llil/binja_mlil/binja_hlil, pyghidra,
+angr, r2, and ida record a per-function op_histogram field directly in
+lift_records.json (see each backend's lift_function). retdec is the one
+exception, same as expansion_ratio.py's category counts: RetDec has no live
+decompiler session to reuse (its .ll output is a static text artifact), so
+its histogram is built here instead, straight from whole_binary.ll via
+_retdec_op_histograms -- see that function's docstring.
 
 Grouping and the fixed-compiler/opt-level requirement
 ------------------------------------------------------
@@ -40,9 +42,11 @@ architecture pair diverges, not just the overall mean.
 """
 
 import itertools
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
 
-from pipeline.metrics.blocks.expansion_ratio import _load_lift_records
+from pipeline.metrics.blocks.expansion_ratio import _iter_ll_functions, _ll_line_opcode, _load_lift_records
 from pipeline.metrics.formulas import aggregate_stats, weighted_jaccard
 from pipeline.metrics.registry import register_block
 
@@ -61,12 +65,90 @@ def _arch_pair_label(label_a, label_b):
     return "_vs_".join(sorted((label_a, label_b)))
 
 
-def _function_data(outdir):
+# A bare LLVM-IR basic-block label line ("entry:", "if.then:", "16:", optionally
+# followed by a "; preds = ..." comment) -- not a real instruction, but
+# _ll_line_opcode would otherwise extract the label name itself as a bogus
+# "opcode" token. classify_ll_line (category counting) doesn't need this
+# filter -- an uncategorized label just lands harmlessly in "other", which
+# isn't part of any ratio -- but a raw op-histogram has no such safety net:
+# every distinct token becomes its own vocabulary entry, and two
+# architectures' compiler-generated label names (or how many basic blocks
+# they split a function into) differing is a control-flow-shape artifact,
+# not an op-frequency signal.
+_LL_LABEL_RE = re.compile(r"^\s*[\w.$]+:\s*(;.*)?$")
+
+# Every real top-level LLVM-IR instruction opcode RetDec can emit. Needed
+# because _ll_line_opcode/classify_ll_line assume one instruction per
+# physical line, which breaks for multi-line constructs -- chiefly `switch`,
+# whose case-target lines ("i32 0, label %case0") and closing "]" are
+# CONTINUATIONS of the switch on the preceding line, not their own
+# instructions. classify_ll_line already had this same per-line assumption,
+# harmlessly, since a stray "i32"/"]" token just falls into its unused
+# "other" bucket -- but a raw op-histogram has no such bucket, so an
+# unrecognized first token means "not a real instruction, skip it" instead
+# of "count it anyway". Only opcodes need to be listed here (not operands),
+# since a continuation line's first token is never one of these.
+_LL_KNOWN_OPCODES = (
+    # terminators
+    {"ret", "br", "switch", "indirectbr", "invoke", "callbr", "resume",
+     "unreachable", "catchswitch", "catchret", "cleanupret"}
+    # binary/bitwise ops
+    | {"add", "fadd", "sub", "fsub", "mul", "fmul", "udiv", "sdiv", "fdiv",
+       "urem", "srem", "frem", "shl", "lshr", "ashr", "and", "or", "xor"}
+    # memory ops
+    | {"alloca", "load", "store", "fence", "cmpxchg", "atomicrmw", "getelementptr"}
+    # conversion ops
+    | {"trunc", "zext", "sext", "fptrunc", "fpext", "fptoui", "fptosi",
+       "uitofp", "sitofp", "ptrtoint", "inttoptr", "bitcast", "addrspacecast"}
+    # other ops
+    | {"icmp", "fcmp", "phi", "select", "freeze", "call", "va_arg",
+       "landingpad", "catchpad", "cleanuppad", "extractelement",
+       "insertelement", "shufflevector", "extractvalue", "insertvalue"}
+)
+
+
+def _retdec_op_histograms(outdir):
+    """name -> Counter({opcode: count}) by walking whole_binary.ll's
+    top-level `define` blocks via expansion_ratio.py's shared
+    _iter_ll_functions walker, keyed by the raw LLVM opcode token
+    (_ll_line_opcode) instead of collapsed into a category the way
+    expansion_ratio.py's _retdec_ir_category_counts does. Same rationale as
+    that function for computing this here instead of inside
+    retdec_lift.py: RetDec's .ll output is a static text artifact with no
+    live session to reuse, so parsing it can happen at metrics time.
+
+    Skips the function's own "define ... {" header and closing "}" (the
+    first/last lines _iter_ll_functions includes) and basic-block label
+    lines (see _LL_LABEL_RE) -- none of these are real instructions, and
+    unlike classify_ll_line's category counting, a raw histogram has no
+    "other" bucket to safely absorb them into.
+    """
+    ll_path = Path(outdir) / "whole_binary.ll"
+    if not ll_path.exists():
+        return {}
+    lines = ll_path.read_text(errors="replace").splitlines()
+    histograms = {}
+    for name, func_lines in _iter_ll_functions(lines):
+        histogram = Counter()
+        for line in func_lines[1:-1]:
+            if _LL_LABEL_RE.match(line):
+                continue
+            opcode = _ll_line_opcode(line)
+            if opcode in _LL_KNOWN_OPCODES:
+                histogram[opcode] += 1
+        histograms[name] = histogram
+    return histograms
+
+
+def _function_data(backend, outdir):
     """(names_ok, histograms): names_ok is every successfully-lifted
     function's name (the precondition/match-rate universe); histograms is
-    name -> op_histogram dict, only for functions that have one (currently
-    only binja_llil/mlil/hlil records this field).
+    name -> op_histogram dict, only for functions that have one.
     """
+    if backend == "retdec":
+        histograms = _retdec_op_histograms(outdir)
+        return set(histograms), histograms
+
     names_ok = set()
     histograms = {}
     for record in _load_lift_records(outdir):
@@ -105,7 +187,7 @@ def compute_weighted_jaccard(runs, results_dir):
             continue
         num_groups_evaluated += 1
 
-        data_by_arch = {label: _function_data(run["outdir"]) for label, run in by_arch.items()}
+        data_by_arch = {label: _function_data(backend, run["outdir"]) for label, run in by_arch.items()}
 
         for label_a, label_b in itertools.combinations(sorted(data_by_arch), 2):
             names_a, hist_a = data_by_arch[label_a]

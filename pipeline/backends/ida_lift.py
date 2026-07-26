@@ -22,6 +22,7 @@ The other option is to use Headless IDA with the IDA Pro installation.
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -98,6 +99,21 @@ def _mcode_categories():
     return categories
 
 
+def _mcode_names():
+    """int mcode_t opcode -> its m_* constant name (e.g. "m_add"), the
+    reverse of _mcode_categories -- used as the raw op-identity for the
+    agnosticism metrics' weighted_jaccard (see pipeline/metrics/blocks/
+    agnosticism.py), same rationale as _mcode_categories for not
+    hardcoding numeric opcode values.
+    """
+    names = {}
+    for name in dir(ida_hexrays):
+        if not name.startswith("m_"):
+            continue
+        names[getattr(ida_hexrays, name)] = name
+    return names
+
+
 def ida_arch_key():
     """(arch, bits) in this project's metadata.json convention (see
     pipeline/native_classify.py) for the currently open database, or None if
@@ -153,7 +169,7 @@ def _insn_is_escape(insn):
     return any(op.t == ida_hexrays.mop_h for op in (insn.l, insn.r, insn.d))
 
 
-def _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids):
+def _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram):
     """Recurse into one mop_t (or mop_t-like: mcallarg_t/mop_addr_t share
     the same .t/.d/.f/.a/.pair interface) that may itself hold an embedded
     sub-instruction, and record any mop_l ("local variable") operand along
@@ -181,22 +197,22 @@ def _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids):
     happened" -- see pipeline/metrics/blocks/temporaries.py.
     """
     if op.t == ida_hexrays.mop_d:
-        _walk_minsn_ast(op.d, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+        _walk_minsn_ast(op.d, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
     elif op.t == ida_hexrays.mop_f:
         for arg in op.f.args:
-            _walk_operand_ast(arg, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+            _walk_operand_ast(arg, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
     elif op.t == ida_hexrays.mop_a:
-        _walk_operand_ast(op.a, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+        _walk_operand_ast(op.a, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
     elif op.t == ida_hexrays.mop_p:
-        _walk_operand_ast(op.pair.lop, mcode_categories, ir_ast_counts, mba, temp_var_ids)
-        _walk_operand_ast(op.pair.hop, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+        _walk_operand_ast(op.pair.lop, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
+        _walk_operand_ast(op.pair.hop, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
     elif op.t == ida_hexrays.mop_l:
         lvar = mba.vars[op.l.idx]
         if not lvar.is_arg_var and not lvar.has_user_name:
             temp_var_ids.add(op.l.idx)
 
 
-def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids):
+def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram):
     """Classify one minsn_t by its own opcode, then recurse into its
     operands for any embedded sub-instruction -- the ast-granularity walk
     (see classify_vex_statement_ast/classify_il_function_ast for the same
@@ -217,8 +233,15 @@ def _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids):
     land in "other" instead of "control" if never walked at all.
     """
     ir_ast_counts[mcode_categories.get(insn.opcode, "other")] += 1
+    # Agnosticism metric: op-type frequency histogram (raw opcode name, not
+    # collapsed into a category), compared across architecture builds of
+    # the same binary by pipeline/metrics/blocks/agnosticism.py's
+    # weighted_jaccard. Accumulated at the same ast granularity as
+    # ir_ast_counts (every embedded sub-instruction reachable via mop_d,
+    # not just top-level instructions).
+    op_histogram[mcode_names.get(insn.opcode, f"m_unknown_{insn.opcode}")] += 1
     for op in (insn.l, insn.r, insn.d):
-        _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+        _walk_operand_ast(op, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
 
 
 def _mcode_operand_depth(op):
@@ -251,7 +274,7 @@ def _mcode_insn_depth(insn):
     return 1 + max((_mcode_operand_depth(op) for op in (insn.l, insn.r, insn.d)), default=0)
 
 
-def lift_function(f, mcode_categories, md, family):
+def lift_function(f, mcode_categories, mcode_names, md, family):
     hf = ida_hexrays.hexrays_failure_t()
     cfunc = ida_hexrays.decompile(f.start_ea, hf)
     if cfunc is None:
@@ -267,6 +290,7 @@ def lift_function(f, mcode_categories, md, family):
     num_escape_ops = 0
     max_nesting_depth = 0
     sum_nesting_depth = 0
+    op_histogram = Counter()
     for i in range(mba.qty):
         insn = mba.get_mblock(i).head
         while insn:
@@ -278,7 +302,7 @@ def lift_function(f, mcode_categories, md, family):
             ir_ops_counts[mcode_categories.get(insn.opcode, "other")] += 1
             if _insn_is_escape(insn):
                 num_escape_ops += 1
-            _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids)
+            _walk_minsn_ast(insn, mcode_categories, ir_ast_counts, mba, temp_var_ids, mcode_names, op_histogram)
             # Nesting-depth metric: how deep this one instruction's own
             # operand tree goes (see _mcode_insn_depth).
             depth = _mcode_insn_depth(insn)
@@ -302,7 +326,7 @@ def lift_function(f, mcode_categories, md, family):
     text = "\n".join(lines)
     return (
         total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, text,
+        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
     )
 
 
@@ -329,6 +353,7 @@ def run(binary_path, outdir, limit):
             md = make_disassembler(*arch_key) if arch_key else None
             family = arch_family(*arch_key) if arch_key else None
             mcode_categories = _mcode_categories()
+            mcode_names = _mcode_names()
 
             functions = list_functions()
             write_json(outdir / "functions.json", {
@@ -356,8 +381,8 @@ def run(binary_path, outdir, limit):
                 try:
                     (
                         n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                        n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, text,
-                    ) = lift_function(f, mcode_categories, md, family)
+                        n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+                    ) = lift_function(f, mcode_categories, mcode_names, md, family)
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
                     record["num_native_instructions"] = n_native
@@ -365,6 +390,7 @@ def run(binary_path, outdir, limit):
                     record["num_escape_ops"] = n_escape_ops
                     record["max_nesting_depth"] = max_nesting_depth
                     record["sum_nesting_depth"] = sum_nesting_depth
+                    record["op_histogram"] = dict(op_histogram)
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

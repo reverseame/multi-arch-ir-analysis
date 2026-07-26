@@ -161,24 +161,37 @@ _LL_ARITHMETIC = {
 _LL_CALL_MARKERS = {"tail", "musttail", "notail"}
 
 
-def classify_ll_line(line):
-    """One line of RetDec's LLVM-IR text output -> "arithmetic"/"control"/
-    "memory"/"other". Handles both instruction forms LLVM IR text uses:
-    "%N = OPCODE ..." (value-producing) and a bare "OPCODE ..." (void, e.g.
-    store/br/ret) -- labels, comments, blank lines, and directives
-    (uselistorder, metadata) don't start with any recognized opcode token
-    and fall to "other" with no special-casing needed.
+def _ll_line_opcode(line):
+    """Extract the raw LLVM-IR opcode token from one line of RetDec's .ll
+    text output (e.g. "add", "br", "call"), or None for lines with no
+    opcode -- labels, comments, blank lines, and directives (uselistorder,
+    metadata) don't start with any recognized opcode token. Handles both
+    instruction forms LLVM IR text uses: "%N = OPCODE ..." (value-producing)
+    and a bare "OPCODE ..." (void, e.g. store/br/ret). Shared by
+    classify_ll_line (category classification) and
+    pipeline/metrics/blocks/agnosticism.py's op-frequency histogram (raw
+    opcode identity).
     """
     stripped = line.strip()
     if not stripped:
-        return "other"
+        return None
     rhs = stripped.split("=", 1)[1].strip() if "=" in stripped else stripped
     tokens = rhs.split()
     if not tokens:
-        return "other"
+        return None
     opcode = tokens[0]
     if opcode in _LL_CALL_MARKERS and len(tokens) > 1:
         opcode = tokens[1]
+    return opcode
+
+
+def classify_ll_line(line):
+    """One line of RetDec's LLVM-IR text output -> "arithmetic"/"control"/
+    "memory"/"other", via _ll_line_opcode.
+    """
+    opcode = _ll_line_opcode(line)
+    if opcode is None:
+        return "other"
     if opcode in _LL_CONTROL:
         return "control"
     if opcode in _LL_MEMORY:
@@ -186,6 +199,35 @@ def classify_ll_line(line):
     if opcode in _LL_ARITHMETIC:
         return "arithmetic"
     return "other"
+
+
+def _iter_ll_functions(lines):
+    """Yield (name, function_lines) for every top-level `define` block in a
+    .ll module's lines, using brace-depth tracking (RetDec doesn't nest
+    functions, but a naive line-range split without brace tracking would
+    break on functions containing nested `{`/`}` in literals) -- the same
+    walk retdec_lift.py's own split_ll_by_function uses. Shared by
+    _retdec_ir_category_counts and pipeline/metrics/blocks/agnosticism.py's
+    op-frequency histogram, both of which need the same per-function line
+    range but classify its contents differently.
+    """
+    i = 0
+    while i < len(lines):
+        match = LL_DEFINE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        name = match["name"]
+        start = i
+        depth = 0
+        j = i
+        while j < len(lines):
+            depth += lines[j].count("{") - lines[j].count("}")
+            j += 1
+            if depth == 0 and j > start:
+                break
+        yield name, lines[start:j]
+        i = j
 
 
 def _load_lift_records(outdir):
@@ -269,27 +311,11 @@ def _retdec_ir_category_counts(outdir, binary_path):
         return {}
     lines = ll_path.read_text(errors="replace").splitlines()
     counts = {}
-
-    i = 0
-    while i < len(lines):
-        match = LL_DEFINE_RE.match(lines[i])
-        if not match:
-            i += 1
-            continue
-        name = match["name"]
-        start = i
-        depth = 0
-        j = i
-        while j < len(lines):
-            depth += lines[j].count("{") - lines[j].count("}")
-            j += 1
-            if depth == 0 and j > start:
-                break
+    for name, func_lines in _iter_ll_functions(lines):
         func_counts = _empty_counts()
-        for line in lines[start:j]:
+        for line in func_lines:
             func_counts[classify_ll_line(line)] += 1
         counts[name] = func_counts
-        i = j
     return counts
 
 

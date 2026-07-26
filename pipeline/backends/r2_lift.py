@@ -9,6 +9,7 @@ python3 -m pipeline.backends.r2_lift \
 
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -159,6 +160,24 @@ def classify_esil_expression(esil, esil_operators, pc_register=None):
     return counts
 
 
+def esil_op_histogram(esil, esil_operators):
+    """{operator_token: count} (e.g. "+" -> 3, "=[4]" -> 1) of real ESIL
+    *operator* tokens in one instruction's ESIL expression -- same
+    operator/operand split as classify_esil_expression, but keyed by the raw
+    token instead of collapsed into arithmetic/control/memory/other. Used by
+    the agnosticism metrics' weighted_jaccard (see
+    pipeline/metrics/blocks/agnosticism.py) to compare op-frequency
+    distributions across architecture builds.
+    """
+    counts = Counter()
+    if not esil:
+        return counts
+    for tok in esil.split(","):
+        if tok in esil_operators or tok in _ESIL_FORCE_CONTROL:
+            counts[tok] += 1
+    return counts
+
+
 def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
     data = r2.cmdj(f"pdfj @ {addr}")
     if not data or "ops" not in data:
@@ -169,6 +188,10 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
     num_uncovered = 0
     ir_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard.
+    op_histogram = Counter()
     for op in ops:
         op_addr = op.get("offset", op.get("addr", addr))
         mnem = op.get("opcode", "")
@@ -178,6 +201,7 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
         op_counts = classify_esil_expression(esil, esil_operators, pc_register)
         for cat in CATEGORIES:
             ir_counts[cat] += op_counts[cat]
+        op_histogram.update(esil_op_histogram(esil, esil_operators))
         if md is not None and op.get("bytes"):
             decoded = next(classify_bytes(md, bytes.fromhex(op["bytes"]), op_addr, family), None)
             if decoded is not None:
@@ -196,7 +220,7 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
     # in its own right (ESIL genuinely has no notion of a named temporary),
     # not a measurement gap -- see pipeline/metrics/blocks/temporaries.py.
     num_temp_vars = 0
-    return len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, num_temp_vars, text
+    return len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, num_temp_vars, op_histogram, text
 
 
 def run(binary_path, outdir, limit):
@@ -243,7 +267,7 @@ def run(binary_path, outdir, limit):
                     record = {"function": func["name"], "address": func["address"]}
                     try:
                         md = disassembler_for(func.get("bits"))
-                        n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, n_temp_vars, text = lift_function(
+                        n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, n_temp_vars, op_histogram, text = lift_function(
                             r2, addr, func["name"], esil_operators, md, family, pc_register
                         )
                         record["status"] = "ok"
@@ -251,6 +275,7 @@ def run(binary_path, outdir, limit):
                         record["num_esil_ops"] = n_esil_ops
                         record["num_uncovered"] = n_uncovered
                         record["num_temp_vars"] = n_temp_vars
+                        record["op_histogram"] = dict(op_histogram)
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_counts[cat]
                             record[f"native_{cat}"] = native_counts[cat]

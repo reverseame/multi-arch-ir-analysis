@@ -17,6 +17,7 @@ way) before the JVM starts.
 
 import sys
 import traceback
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -180,6 +181,12 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
     ir_counts = {c: 0 for c in CATEGORIES}
     num_temp_vars = 0
     num_escape_ops = 0
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard. High P-code ops are already flat
+    # (no nested-expression model, see nesting_depth.py's module docstring),
+    # so one mnemonic per op, no traversal beyond this existing loop needed.
+    op_histogram = Counter()
     op_iter = high_func.getPcodeOps()
     while op_iter.hasNext():
         op = op_iter.next()
@@ -191,6 +198,7 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
         total_ops += 1
         mnemonic = op.getMnemonic()
         ir_counts[classify_pcode_op(mnemonic)] += 1
+        op_histogram[mnemonic] += 1
         # Escape-valve metric: CALLOTHER is P-code's own generic fallback for
         # semantics it can't express as a primitive op (e.g. x86 CPUID/RDTSC,
         # architecture-specific intrinsics)
@@ -220,7 +228,7 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, num_escape_ops, text
+    return total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, num_escape_ops, op_histogram, text
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -292,7 +300,7 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, n_native, ir_counts, native_counts, n_temp_vars, n_escape_ops, text = lift_function(
+                                n_ops, n_native, ir_counts, native_counts, n_temp_vars, n_escape_ops, op_histogram, text = lift_function(
                                     ifc, func, language, monitor, decomp_timeout_s, listing, md, family
                                 )
                                 record["status"] = "ok"
@@ -300,6 +308,7 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 record["num_native_instructions"] = n_native
                                 record["num_temp_vars"] = n_temp_vars
                                 record["num_escape_ops"] = n_escape_ops
+                                record["op_histogram"] = dict(op_histogram)
                                 for cat in CATEGORIES:
                                     record[f"ir_ops_{cat}"] = ir_counts[cat]
                                     record[f"native_{cat}"] = native_counts[cat]

@@ -24,6 +24,7 @@ from pipeline.binja_il_classify import (
     bnil_instruction_depth,
     classify_il_function_ast,
     classify_il_function_escape,
+    classify_il_function_op_histogram,
     classify_il_function_ops,
     classify_native_instructions,
     is_bnil_temp_var,
@@ -78,9 +79,14 @@ def lift_function(func, bv):
     # alternate view of this same function.
     mlil_ssa = mlil.ssa_form
     num_ssa_instructions = sum(1 for _ in mlil_ssa.instructions) if mlil_ssa is not None else None
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard.
+    op_histogram = classify_il_function_op_histogram(mlil)
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
-        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, num_ssa_instructions, text,
+        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, num_ssa_instructions,
+        op_histogram, text,
     )
 
 
@@ -112,7 +118,8 @@ def run(binary_path, outdir, limit):
                     try:
                         (
                             n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
-                            n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, n_ssa_instr, text,
+                            n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, n_ssa_instr,
+                            op_histogram, text,
                         ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_mlil_instructions"] = n_instr
@@ -122,6 +129,7 @@ def run(binary_path, outdir, limit):
                         record["max_nesting_depth"] = max_nesting_depth
                         record["sum_nesting_depth"] = sum_nesting_depth
                         record["num_ssa_instructions"] = n_ssa_instr
+                        record["op_histogram"] = dict(op_histogram)
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

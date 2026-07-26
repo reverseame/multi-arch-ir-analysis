@@ -37,6 +37,7 @@ a value rather than compute a new one.
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -202,6 +203,26 @@ def classify_il_function_ast(il_func):
     counts = {"arithmetic": 0, "control": 0, "memory": 0, "other": 0}
     for operation in il_func.traverse(lambda instr: instr.operation):
         counts[classify_il_operation(operation.name)] += 1
+    return counts
+
+
+def classify_il_function_op_histogram(il_func):
+    """{operation_name: count} (e.g. "LLIL_ADD" -> 12) over every instruction
+    and sub-expression in `il_func`, via the same il_func.traverse() as
+    classify_il_function_ast -- but keyed by the raw operation name instead
+    of collapsed into arithmetic/control/memory/other.
+
+    Used by the agnosticism metrics' weighted Jaccard (see
+    pipeline/metrics/blocks/agnosticism.py) to compare op-frequency
+    distributions across architecture builds of the same IR level. Kept at
+    full op-name granularity (not suffix-stripped like classify_il_operation
+    does) because agnosticism only ever compares within one IR level at a
+    time, where the level prefix is already shared and doesn't need
+    normalizing away.
+    """
+    counts = Counter()
+    for operation in il_func.traverse(lambda instr: instr.operation):
+        counts[operation.name] += 1
     return counts
 
 

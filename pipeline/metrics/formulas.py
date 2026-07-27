@@ -13,6 +13,7 @@ Direction of each metric (see possible_metrics.txt for definitions):
                              consistency.
 """
 
+import math
 import statistics
 
 # Expansion ratio block
@@ -44,6 +45,38 @@ def weighted_jaccard(hist_a, hist_b):
     if denom == 0:
         return None
     return numer / denom
+
+
+def jensen_shannon_similarity(hist_a, hist_b):
+    """Jensen-Shannon similarity between two op-frequency histograms
+    ({op_name: count}), normalized to [0,1] where 1.0 = identical
+    distributions. Complements weighted_jaccard: both measure distributional
+    overlap, but JSD is a true probability-distance (each histogram is
+    normalized to sum to 1 first) and handles zero-frequency ops cleanly via
+    the convention 0*log(0/x) = 0, whereas weighted_jaccard works directly
+    on raw counts. Computed as 1 - sqrt(JSD_bits), the Jensen-Shannon
+    distance (a proper metric, unlike JSD itself) using log base 2 so
+    JSD_bits is bounded in [0,1] and the distance is too. Returns None only
+    if BOTH histograms are empty (nothing to compare at all) -- mirrors
+    weighted_jaccard's same both-vs-one-sided distinction.
+    """
+    total_a = sum(hist_a.values())
+    total_b = sum(hist_b.values())
+    if not total_a and not total_b:
+        return None
+    if not total_a or not total_b:
+        return 0.0
+    keys = hist_a.keys() | hist_b.keys()
+    p = {k: hist_a.get(k, 0) / total_a for k in keys}
+    q = {k: hist_b.get(k, 0) / total_b for k in keys}
+    m = {k: 0.5 * (p[k] + q[k]) for k in keys}
+
+    def kl_div(dist):
+        return sum(dist[k] * math.log2(dist[k] / m[k]) for k in keys if dist[k] > 0)
+
+    jsd_bits = 0.5 * kl_div(p) + 0.5 * kl_div(q)
+    jsd_bits = min(max(jsd_bits, 0.0), 1.0)  # clamp float noise at the [0,1] bound
+    return 1.0 - math.sqrt(jsd_bits)
 
 
 def aggregate_stats(values):

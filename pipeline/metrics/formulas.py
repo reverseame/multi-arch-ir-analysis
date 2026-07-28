@@ -79,6 +79,24 @@ def jensen_shannon_similarity(hist_a, hist_b):
     return 1.0 - math.sqrt(jsd_bits)
 
 
+def coefficient_of_variation(values):
+    """Coefficient of variation (sample stdev / mean) over a list of IR-size
+    values for the same function across different architectures -- 0.0 means
+    IR size is identical across every architecture compared, higher means
+    lifted size diverges more per architecture for otherwise-equivalent
+    source. Needs at least 2 values (sample stdev is undefined for 1) and a
+    non-zero mean (an all-zero-size function has no meaningful ratio).
+    Returns None in either of those cases.
+    """
+    clean = [v for v in values if v is not None]
+    if len(clean) < 2:
+        return None
+    mean = statistics.mean(clean)
+    if mean == 0:
+        return None
+    return statistics.stdev(clean) / mean
+
+
 def aggregate_stats(values):
     """mean/median/min/max/n over `values`, skipping Nones.
 

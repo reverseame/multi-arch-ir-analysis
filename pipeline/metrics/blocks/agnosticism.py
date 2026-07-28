@@ -1,16 +1,19 @@
 """Agnosticism metrics block: how consistent a binary's IR representation
 stays, within one backend/IR level, when the same source is compiled for
-different target architectures (x86/ARM/MIPS/...). Two metrics implemented
-so far, both over the same per-function op-type frequency histograms:
+different target architectures (x86/ARM/MIPS/...). Three metrics implemented
+so far. Two operate over the same per-function op-type frequency histograms:
 weighted Jaccard (Ruzicka) similarity and Jensen-Shannon similarity -- see
 pipeline/metrics/formulas.py's weighted_jaccard/jensen_shannon_similarity
 and possible_metrics.txt's "Distributional" section. Kept as separate
 blocks/metrics (not treated as redundant) since they're a cross-validation
 pair: same distributional-overlap question, different math (raw-count
 ratio vs. normalized-probability distance), so agreement between them is
-itself a signal. IR-size coefficient of variation and cyclomatic complexity
-delta are planned follow-ups in this same file, added one at a time the way
-robustness.py's error_rate_by_category/escape_fraction were.
+itself a signal. The third, ir_size_cv, reuses each backend's existing
+per-function IR-size field (expansion_ratio.py's IR_SIZE_FIELDS) instead of
+the histograms -- see pipeline/metrics/formulas.py's
+coefficient_of_variation. Cyclomatic complexity delta is a planned follow-up
+in this same file, added one at a time the way robustness.py's
+error_rate_by_category/escape_fraction were.
 
 All 8 backends are covered. binja_llil/binja_mlil/binja_hlil, pyghidra,
 angr, r2, and ida record a per-function op_histogram field directly in
@@ -50,8 +53,8 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from pipeline.metrics.blocks.expansion_ratio import _iter_ll_functions, _ll_line_opcode, _load_lift_records
-from pipeline.metrics.formulas import aggregate_stats, jensen_shannon_similarity, weighted_jaccard
+from pipeline.metrics.blocks.expansion_ratio import IR_SIZE_FIELDS, _iter_ll_functions, _ll_line_opcode, _load_lift_records
+from pipeline.metrics.formulas import aggregate_stats, coefficient_of_variation, jensen_shannon_similarity, weighted_jaccard
 from pipeline.metrics.registry import register_block
 
 GROUP_META_KEYS = ("project", "project_version", "compiler", "compiler_version", "opt", "name")
@@ -164,6 +167,29 @@ def _function_data(backend, outdir):
         if histogram is not None:
             histograms[name] = histogram
     return names_ok, histograms
+
+
+def _function_ir_sizes(backend, outdir):
+    """(names_ok, ir_sizes): names_ok is every successfully-lifted function's
+    name (the precondition/match-rate universe, matching _function_data's
+    convention); ir_sizes is name -> ir_size, read straight from each
+    backend's IR_SIZE_FIELDS field in lift_records.json. Unlike op_histogram,
+    every backend (including retdec) already records its ir_size field
+    directly during lifting -- see expansion_ratio.py's IR_SIZE_FIELDS
+    docstring -- so no whole_binary.ll post-hoc parsing is needed here.
+    """
+    ir_field = IR_SIZE_FIELDS[backend]
+    names_ok = set()
+    ir_sizes = {}
+    for record in _load_lift_records(outdir):
+        if record.get("status") != "ok":
+            continue
+        name = record.get("function")
+        names_ok.add(name)
+        ir_size = record.get(ir_field)
+        if ir_size is not None:
+            ir_sizes[name] = ir_size
+    return names_ok, ir_sizes
 
 
 @register_block("weighted_jaccard")
@@ -338,6 +364,96 @@ def compute_jsd_similarity(runs, results_dir):
         "by_arch_pair": {
             pair: {
                 "jsd_similarity": aggregate_stats(vals),
+                "function_match_rate": aggregate_stats(match_rates_by_pair[pair]),
+            }
+            for pair, vals in by_arch_pair.items()
+        },
+        "rows": rows,
+    }
+
+
+@register_block("ir_size_cv")
+def compute_ir_size_cv(runs, results_dir):
+    completed = [r for r in runs if r.get("status") == "ok" and r["backend"] in IR_SIZE_FIELDS]
+
+    groups = defaultdict(dict)
+    for run in completed:
+        meta = run.get("binary_meta") or {}
+        if meta.get("arch") is None or meta.get("bits") is None:
+            continue
+        key = (_group_key(meta), run["backend"])
+        groups[key].setdefault(_arch_label(meta), run)
+
+    overall = []
+    by_backend = defaultdict(list)
+    by_arch_pair = defaultdict(list)
+    match_rates_overall = []
+    match_rates_by_pair = defaultdict(list)
+    rows = []
+    num_groups_evaluated = 0
+
+    for (group_key, backend), by_arch in groups.items():
+        if len(by_arch) < 2:
+            continue
+        num_groups_evaluated += 1
+
+        data_by_arch = {label: _function_ir_sizes(backend, run["outdir"]) for label, run in by_arch.items()}
+
+        for label_a, label_b in itertools.combinations(sorted(data_by_arch), 2):
+            names_a, sizes_a = data_by_arch[label_a]
+            names_b, sizes_b = data_by_arch[label_b]
+            union = names_a | names_b
+            matched = names_a & names_b
+            pair_label = _arch_pair_label(label_a, label_b)
+
+            if union:
+                match_rate = len(matched) / len(union)
+                match_rates_overall.append(match_rate)
+                match_rates_by_pair[pair_label].append(match_rate)
+
+            for name in sorted(matched):
+                if name not in sizes_a or name not in sizes_b:
+                    continue
+                cv = coefficient_of_variation([sizes_a[name], sizes_b[name]])
+                if cv is None:
+                    continue
+                rows.append({
+                    "project": group_key[0],
+                    "project_version": group_key[1],
+                    "compiler": group_key[2],
+                    "compiler_version": group_key[3],
+                    "opt": group_key[4],
+                    "binary": group_key[5],
+                    "backend": backend,
+                    "arch_pair": pair_label,
+                    "function": name,
+                    "ir_size_cv": cv,
+                })
+                overall.append(cv)
+                by_backend[backend].append(cv)
+                by_arch_pair[pair_label].append(cv)
+
+    return {
+        "block": "ir_size_cv",
+        "num_groups_evaluated": num_groups_evaluated,
+        "num_functions_evaluated": len(rows),
+        "metrics": {
+            "ir_size_cv": {
+                "direction": "lower_is_better", "range": "[0,inf)",
+                **(aggregate_stats(overall) or {"n": 0}),
+            },
+            "function_match_rate": {
+                "direction": "descriptive", "range": "[0,1]",
+                **(aggregate_stats(match_rates_overall) or {"n": 0}),
+            },
+        },
+        "by_backend": {
+            backend: {"ir_size_cv": aggregate_stats(vals)}
+            for backend, vals in by_backend.items()
+        },
+        "by_arch_pair": {
+            pair: {
+                "ir_size_cv": aggregate_stats(vals),
                 "function_match_rate": aggregate_stats(match_rates_by_pair[pair]),
             }
             for pair, vals in by_arch_pair.items()

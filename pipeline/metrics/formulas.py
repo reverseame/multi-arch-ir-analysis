@@ -97,6 +97,20 @@ def coefficient_of_variation(values):
     return statistics.stdev(clean) / mean
 
 
+def cyclomatic_complexity(num_blocks, num_edges):
+    """McCabe cyclomatic complexity of one function's control-flow graph:
+    M = E - N + 2 (edges minus basic blocks plus 2), for a single connected
+    component with one entry point -- the standard formula, e.g. a
+    straight-line function with no branches is 1 block/0 edges -> M=1, one
+    if-statement is 2 blocks/2 edges -> M=2. Returns None if either count is
+    missing (rather than treating a missing block/edge count as 0, which
+    would silently fabricate a complexity value).
+    """
+    if num_blocks is None or num_edges is None:
+        return None
+    return num_edges - num_blocks + 2
+
+
 def aggregate_stats(values):
     """mean/median/min/max/n over `values`, skipping Nones.
 

@@ -281,6 +281,35 @@ def lift_function(f, mcode_categories, mcode_names, md, family):
         raise RuntimeError(hf.desc() or "decompilation failed")
 
     mba = cfunc.mba
+    # Cyclomatic-complexity metric: mba_t.qty is the microcode array's own
+    # basic-block count and mblock_t.succset is each block's own successor-
+    # block-serial set -- the standard Hex-Rays microcode CFG accessors
+    # (mbl_array_t/mblock_t, hexrays.hpp). mba always includes a synthetic
+    # empty entry stub (block 0) and exit stub (the last block); for an
+    # ordinary function these are simple single-successor/predecessor
+    # pass-throughs, which don't change M = E - N + 2 (inserting a
+    # pass-through node adds exactly one node and one edge, which cancel).
+    # BUT for a function ending in a call to a noreturn function (longjmp,
+    # abort, _exit, __assert_fail, ...), Hex-Rays knows control never falls
+    # through, so the exit stub gets no incoming edge from the real code --
+    # confirmed live against this project's own corpus (`.longjmp`: block 0
+    # -> block 1 -> nothing, block 2 is fully isolated, succset=predset=());
+    # left uncorrected this makes the exit stub a second, disconnected
+    # component (M's "+2" assumes exactly one component), producing an
+    # impossible M=0 for a function whose real code is a single straight-
+    # line call. Filtered out here by excluding any block that is both
+    # unreachable (empty predset) and a dead end (empty succset) -- true of
+    # only this synthetic-stub case, never of a real reachable block, since
+    # every real block is reached via at least one edge from mba's own
+    # entry point. Used by pipeline/metrics/blocks/agnosticism.py's
+    # cyclomatic_complexity_delta.
+    live_blocks = [
+        mba.get_mblock(i) for i in range(mba.qty)
+        if mba.get_mblock(i).succset or mba.get_mblock(i).predset
+    ]
+    num_cfg_blocks = len(live_blocks)
+    num_cfg_edges = sum(len(b.succset) for b in live_blocks)
+
     lines = [f"; ---- function {ida_funcs.get_func_name(f.start_ea)} @ {hex(f.start_ea)} ----"]
     total_ops = 0
     current_ea = None
@@ -327,6 +356,7 @@ def lift_function(f, mcode_categories, mcode_names, md, family):
     return (
         total_ops, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
         num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+        num_cfg_blocks, num_cfg_edges,
     )
 
 
@@ -382,6 +412,7 @@ def run(binary_path, outdir, limit):
                     (
                         n_ops, n_native, ir_ops_counts, ir_ast_counts, native_counts,
                         n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+                        n_cfg_blocks, n_cfg_edges,
                     ) = lift_function(f, mcode_categories, mcode_names, md, family)
                     record["status"] = "ok"
                     record["num_microcode_ops"] = n_ops
@@ -390,6 +421,8 @@ def run(binary_path, outdir, limit):
                     record["num_escape_ops"] = n_escape_ops
                     record["max_nesting_depth"] = max_nesting_depth
                     record["sum_nesting_depth"] = sum_nesting_depth
+                    record["num_cfg_blocks"] = n_cfg_blocks
+                    record["num_cfg_edges"] = n_cfg_edges
                     record["op_histogram"] = dict(op_histogram)
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]

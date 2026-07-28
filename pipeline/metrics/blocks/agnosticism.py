@@ -1,19 +1,20 @@
 """Agnosticism metrics block: how consistent a binary's IR representation
 stays, within one backend/IR level, when the same source is compiled for
-different target architectures (x86/ARM/MIPS/...). Three metrics implemented
-so far. Two operate over the same per-function op-type frequency histograms:
-weighted Jaccard (Ruzicka) similarity and Jensen-Shannon similarity -- see
-pipeline/metrics/formulas.py's weighted_jaccard/jensen_shannon_similarity
-and possible_metrics.txt's "Distributional" section. Kept as separate
-blocks/metrics (not treated as redundant) since they're a cross-validation
-pair: same distributional-overlap question, different math (raw-count
-ratio vs. normalized-probability distance), so agreement between them is
-itself a signal. The third, ir_size_cv, reuses each backend's existing
-per-function IR-size field (expansion_ratio.py's IR_SIZE_FIELDS) instead of
-the histograms -- see pipeline/metrics/formulas.py's
-coefficient_of_variation. Cyclomatic complexity delta is a planned follow-up
-in this same file, added one at a time the way robustness.py's
-error_rate_by_category/escape_fraction were.
+different target architectures (x86/ARM/MIPS/...). All 4 planned metrics
+are implemented. Two operate over the same per-function op-type frequency
+histograms: weighted Jaccard (Ruzicka) similarity and Jensen-Shannon
+similarity -- see pipeline/metrics/formulas.py's weighted_jaccard/
+jensen_shannon_similarity and possible_metrics.txt's "Distributional"
+section. Kept as separate blocks/metrics (not treated as redundant) since
+they're a cross-validation pair: same distributional-overlap question,
+different math (raw-count ratio vs. normalized-probability distance), so
+agreement between them is itself a signal. ir_size_cv reuses each backend's
+existing per-function IR-size field (expansion_ratio.py's IR_SIZE_FIELDS)
+instead of the histograms -- see pipeline/metrics/formulas.py's
+coefficient_of_variation. cyclomatic_complexity_delta needed a new
+per-function (num_cfg_blocks, num_cfg_edges) pair instrumented across all 8
+backends (see each backend's lift_function) -- see pipeline/metrics/
+formulas.py's cyclomatic_complexity (the standard McCabe M = E - N + 2).
 
 All 8 backends are covered. binja_llil/binja_mlil/binja_hlil, pyghidra,
 angr, r2, and ida record a per-function op_histogram field directly in
@@ -54,7 +55,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from pipeline.metrics.blocks.expansion_ratio import IR_SIZE_FIELDS, _iter_ll_functions, _ll_line_opcode, _load_lift_records
-from pipeline.metrics.formulas import aggregate_stats, coefficient_of_variation, jensen_shannon_similarity, weighted_jaccard
+from pipeline.metrics.formulas import (
+    aggregate_stats,
+    coefficient_of_variation,
+    cyclomatic_complexity,
+    jensen_shannon_similarity,
+    weighted_jaccard,
+)
 from pipeline.metrics.registry import register_block
 
 GROUP_META_KEYS = ("project", "project_version", "compiler", "compiler_version", "opt", "name")
@@ -147,6 +154,65 @@ def _retdec_op_histograms(outdir):
     return histograms
 
 
+# A terminator instruction's branch-target operand is always written as a
+# literal "label %name" token in RetDec's LLVM-IR text output -- this is
+# true for every LLVM opcode that can transfer control to another basic
+# block within the function (br's one or two targets, switch's default
+# target plus every "case" line, indirectbr's whole bracketed target list,
+# invoke's normal/unwind pair, callbr's fallthrough plus bracketed targets,
+# catchswitch/catchret/cleanupret's handler targets) -- and no other REAL
+# instruction's operand syntax uses the word "label" (phi's incoming-block
+# operand is a bare "%name" inside "[ %val, %name ]", without the word
+# "label"). One non-instruction exception: a trailing "uselistorder label
+# %name, { ... }" directive (LLVM's serialization of a value's use-list
+# order, purely a textual/IR-printing detail with no control-flow meaning)
+# can also reference a label operand this same way -- confirmed against this
+# project's own real RetDec output (689 such lines across one `ls` build,
+# vs. 3296 real br/51 real switch/747 switch-case-continuation matches), so
+# _retdec_cfg_counts filters those lines out before counting. So counting
+# _LL_LABEL_TARGET_RE matches across a function's whole body (uselistorder
+# lines excluded) gives its total edge count directly, one match per edge,
+# without needing to first split the body into individual blocks or
+# special-case switch's own multi-line case-list syntax the way
+# _retdec_op_histograms/_LL_KNOWN_OPCODES has to for opcode-token counting.
+_LL_LABEL_TARGET_RE = re.compile(r"\blabel\s+%[\w.$]+")
+_LL_USELISTORDER_RE = re.compile(r"^\s*uselistorder\b")
+
+
+def _retdec_cfg_counts(outdir):
+    """name -> (num_blocks, num_edges) by walking whole_binary.ll's
+    top-level `define` blocks via the shared _iter_ll_functions walker, for
+    the cyclomatic-complexity metric (see pipeline/metrics/formulas.py's
+    cyclomatic_complexity). Same rationale as _retdec_op_histograms for
+    computing this here instead of inside retdec_lift.py: RetDec's .ll
+    output is a static text artifact with no live session to reuse.
+
+    num_blocks: one per basic-block label line in the body (_LL_LABEL_RE,
+    the same label-detection already used to skip these lines when building
+    the op-frequency histogram) -- RetDec labels every block including the
+    function's own entry (confirmed against this project's own real RetDec
+    output: 572/572 functions in one `ls` build have a label line
+    immediately after "define ... {"), unlike raw/unoptimized LLVM IR from
+    other toolchains, which conventionally leaves the entry block unlabeled.
+
+    num_edges: see _LL_LABEL_TARGET_RE / _LL_USELISTORDER_RE.
+    """
+    ll_path = Path(outdir) / "whole_binary.ll"
+    if not ll_path.exists():
+        return {}
+    lines = ll_path.read_text(errors="replace").splitlines()
+    counts = {}
+    for name, func_lines in _iter_ll_functions(lines):
+        body = func_lines[1:-1]
+        num_blocks = sum(1 for line in body if _LL_LABEL_RE.match(line))
+        num_edges = sum(
+            len(_LL_LABEL_TARGET_RE.findall(line)) for line in body
+            if not _LL_USELISTORDER_RE.match(line)
+        )
+        counts[name] = (num_blocks, num_edges)
+    return counts
+
+
 def _function_data(backend, outdir):
     """(names_ok, histograms): names_ok is every successfully-lifted
     function's name (the precondition/match-rate universe); histograms is
@@ -190,6 +256,29 @@ def _function_ir_sizes(backend, outdir):
         if ir_size is not None:
             ir_sizes[name] = ir_size
     return names_ok, ir_sizes
+
+
+def _function_cfg_counts(backend, outdir):
+    """(names_ok, cfg_counts): names_ok mirrors _function_data's/
+    _function_ir_sizes' universe convention; cfg_counts is
+    name -> (num_blocks, num_edges), for cyclomatic_complexity_delta.
+    """
+    if backend == "retdec":
+        cfg_counts = _retdec_cfg_counts(outdir)
+        return set(cfg_counts), cfg_counts
+
+    names_ok = set()
+    cfg_counts = {}
+    for record in _load_lift_records(outdir):
+        if record.get("status") != "ok":
+            continue
+        name = record.get("function")
+        names_ok.add(name)
+        blocks = record.get("num_cfg_blocks")
+        edges = record.get("num_cfg_edges")
+        if blocks is not None and edges is not None:
+            cfg_counts[name] = (blocks, edges)
+    return names_ok, cfg_counts
 
 
 @register_block("weighted_jaccard")
@@ -454,6 +543,98 @@ def compute_ir_size_cv(runs, results_dir):
         "by_arch_pair": {
             pair: {
                 "ir_size_cv": aggregate_stats(vals),
+                "function_match_rate": aggregate_stats(match_rates_by_pair[pair]),
+            }
+            for pair, vals in by_arch_pair.items()
+        },
+        "rows": rows,
+    }
+
+
+@register_block("cyclomatic_complexity_delta")
+def compute_cyclomatic_complexity_delta(runs, results_dir):
+    completed = [r for r in runs if r.get("status") == "ok"]
+
+    groups = defaultdict(dict)
+    for run in completed:
+        meta = run.get("binary_meta") or {}
+        if meta.get("arch") is None or meta.get("bits") is None:
+            continue
+        key = (_group_key(meta), run["backend"])
+        groups[key].setdefault(_arch_label(meta), run)
+
+    overall = []
+    by_backend = defaultdict(list)
+    by_arch_pair = defaultdict(list)
+    match_rates_overall = []
+    match_rates_by_pair = defaultdict(list)
+    rows = []
+    num_groups_evaluated = 0
+
+    for (group_key, backend), by_arch in groups.items():
+        if len(by_arch) < 2:
+            continue
+        num_groups_evaluated += 1
+
+        data_by_arch = {label: _function_cfg_counts(backend, run["outdir"]) for label, run in by_arch.items()}
+
+        for label_a, label_b in itertools.combinations(sorted(data_by_arch), 2):
+            names_a, cfg_a = data_by_arch[label_a]
+            names_b, cfg_b = data_by_arch[label_b]
+            union = names_a | names_b
+            matched = names_a & names_b
+            pair_label = _arch_pair_label(label_a, label_b)
+
+            if union:
+                match_rate = len(matched) / len(union)
+                match_rates_overall.append(match_rate)
+                match_rates_by_pair[pair_label].append(match_rate)
+
+            for name in sorted(matched):
+                if name not in cfg_a or name not in cfg_b:
+                    continue
+                complexity_a = cyclomatic_complexity(*cfg_a[name])
+                complexity_b = cyclomatic_complexity(*cfg_b[name])
+                if complexity_a is None or complexity_b is None:
+                    continue
+                delta = abs(complexity_a - complexity_b)
+                rows.append({
+                    "project": group_key[0],
+                    "project_version": group_key[1],
+                    "compiler": group_key[2],
+                    "compiler_version": group_key[3],
+                    "opt": group_key[4],
+                    "binary": group_key[5],
+                    "backend": backend,
+                    "arch_pair": pair_label,
+                    "function": name,
+                    "cyclomatic_complexity_delta": delta,
+                })
+                overall.append(delta)
+                by_backend[backend].append(delta)
+                by_arch_pair[pair_label].append(delta)
+
+    return {
+        "block": "cyclomatic_complexity_delta",
+        "num_groups_evaluated": num_groups_evaluated,
+        "num_functions_evaluated": len(rows),
+        "metrics": {
+            "cyclomatic_complexity_delta": {
+                "direction": "lower_is_better", "range": "[0,inf)",
+                **(aggregate_stats(overall) or {"n": 0}),
+            },
+            "function_match_rate": {
+                "direction": "descriptive", "range": "[0,1]",
+                **(aggregate_stats(match_rates_overall) or {"n": 0}),
+            },
+        },
+        "by_backend": {
+            backend: {"cyclomatic_complexity_delta": aggregate_stats(vals)}
+            for backend, vals in by_backend.items()
+        },
+        "by_arch_pair": {
+            pair: {
+                "cyclomatic_complexity_delta": aggregate_stats(vals),
                 "function_match_rate": aggregate_stats(match_rates_by_pair[pair]),
             }
             for pair, vals in by_arch_pair.items()

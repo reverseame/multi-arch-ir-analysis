@@ -258,6 +258,22 @@ def bnil_instruction_depth(instr):
     return 1 + max_child_depth
 
 
+def il_function_cfg_counts(il_func):
+    """(num_blocks, num_edges) over `il_func`'s (LLIL/MLIL/HLIL) own
+    basic-block-level control-flow graph. `il_func.basic_blocks` lists each
+    IL-level basic block (the same block granularity classify_native_
+    instructions already walks via the native Function.basic_blocks below);
+    each block's `.outgoing_edges` gives its own real successor edges (one
+    per branch target, including a plain unconditional fallthrough) -- used
+    by the agnosticism metrics' cyclomatic_complexity_delta (see
+    pipeline/metrics/blocks/agnosticism.py) via the standard M = E - N + 2
+    formula.
+    """
+    blocks = list(il_func.basic_blocks)
+    num_edges = sum(len(bb.outgoing_edges) for bb in blocks)
+    return len(blocks), num_edges
+
+
 # --- native-instruction classification (shared with the other 4 backends
 # via pipeline/native_classify.py) --------------------------------------
 

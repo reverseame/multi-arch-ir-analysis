@@ -27,6 +27,7 @@ from pipeline.binja_il_classify import (
     classify_il_function_op_histogram,
     classify_il_function_ops,
     classify_native_instructions,
+    il_function_cfg_counts,
     is_bnil_temp_var,
 )
 
@@ -84,10 +85,18 @@ def lift_function(func, bv):
     # architecture builds of the same binary by pipeline/metrics/blocks/
     # agnosticism.py's weighted_jaccard.
     op_histogram = classify_il_function_op_histogram(hlil)
+    # Cyclomatic-complexity metric: see pipeline/binja_il_classify.py's
+    # il_function_cfg_counts / pipeline/metrics/blocks/agnosticism.py's
+    # cyclomatic_complexity_delta. HLIL's basic-block graph is the same
+    # underlying block structure as LLIL/MLIL (Binary Ninja's control-flow
+    # structuring into if/while/for is a *rendering* of this same graph, not
+    # a replacement for it -- il_func.basic_blocks/outgoing_edges are still
+    # exposed at HLIL the same way).
+    num_cfg_blocks, num_cfg_edges = il_function_cfg_counts(hlil)
     return (
         num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
         num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, num_ssa_instructions,
-        op_histogram, text,
+        op_histogram, text, num_cfg_blocks, num_cfg_edges,
     )
 
 
@@ -120,7 +129,7 @@ def run(binary_path, outdir, limit):
                         (
                             n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
                             n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, n_ssa_instr,
-                            op_histogram, text,
+                            op_histogram, text, n_cfg_blocks, n_cfg_edges,
                         ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_hlil_instructions"] = n_instr
@@ -130,6 +139,8 @@ def run(binary_path, outdir, limit):
                         record["max_nesting_depth"] = max_nesting_depth
                         record["sum_nesting_depth"] = sum_nesting_depth
                         record["num_ssa_instructions"] = n_ssa_instr
+                        record["num_cfg_blocks"] = n_cfg_blocks
+                        record["num_cfg_edges"] = n_cfg_edges
                         record["op_histogram"] = dict(op_histogram)
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]

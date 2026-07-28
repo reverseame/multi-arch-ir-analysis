@@ -175,6 +175,17 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
     if high_func is None:
         raise RuntimeError("decompiler produced no HighFunction")
 
+    # Cyclomatic-complexity metric: HighFunction.getBasicBlocks() (inherited
+    # from PcodeSyntaxTree) gives the high-P-code-level basic blocks --
+    # PcodeBlockBasic.getOutSize() is each block's own real successor-edge
+    # count (verified via the SoftwareModeling.jar class files in this
+    # Ghidra install: PcodeBlock.getOutSize()/getOutSize() are the base
+    # class's own edge accessors). Used by pipeline/metrics/blocks/
+    # agnosticism.py's cyclomatic_complexity_delta via M = E - N + 2.
+    cfg_blocks = high_func.getBasicBlocks()
+    num_cfg_blocks = len(cfg_blocks)
+    num_cfg_edges = sum(block.getOutSize() for block in cfg_blocks)
+
     lines = [f"; ---- function {func.getName()} @ {func.getEntryPoint()} ----"]
     total_ops = 0
     current_addr = None
@@ -228,7 +239,10 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, num_escape_ops, op_histogram, text
+    return (
+        total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, num_escape_ops,
+        op_histogram, text, num_cfg_blocks, num_cfg_edges,
+    )
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -300,7 +314,10 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, n_native, ir_counts, native_counts, n_temp_vars, n_escape_ops, op_histogram, text = lift_function(
+                                (
+                                    n_ops, n_native, ir_counts, native_counts, n_temp_vars, n_escape_ops,
+                                    op_histogram, text, n_cfg_blocks, n_cfg_edges,
+                                ) = lift_function(
                                     ifc, func, language, monitor, decomp_timeout_s, listing, md, family
                                 )
                                 record["status"] = "ok"
@@ -308,6 +325,8 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 record["num_native_instructions"] = n_native
                                 record["num_temp_vars"] = n_temp_vars
                                 record["num_escape_ops"] = n_escape_ops
+                                record["num_cfg_blocks"] = n_cfg_blocks
+                                record["num_cfg_edges"] = n_cfg_edges
                                 record["op_histogram"] = dict(op_histogram)
                                 for cat in CATEGORIES:
                                     record[f"ir_ops_{cat}"] = ir_counts[cat]

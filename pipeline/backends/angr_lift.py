@@ -187,6 +187,18 @@ def list_functions(cfg):
 
 
 def lift_function(proj, func, cs_arch, family):
+    # Cyclomatic-complexity metric: func.graph is angr's own local transition
+    # graph for this function (block-level nodes, transition/exception/
+    # fake_return edges only -- calls to *other* functions are excluded, and
+    # a call's fallthrough is represented as a fake_return edge back into
+    # this same graph), already cached from CFGFast -- verified live against
+    # this project's own x86/32 `ls` corpus (main: 131 nodes/175 edges ->
+    # M=46, a plausible complexity for a large branchy function). See
+    # pipeline/metrics/blocks/agnosticism.py's cyclomatic_complexity_delta.
+    cfg_graph = func.graph
+    num_cfg_blocks = cfg_graph.number_of_nodes()
+    num_cfg_edges = cfg_graph.number_of_edges()
+
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
     total_native_instructions = 0
@@ -263,6 +275,7 @@ def lift_function(proj, func, cs_arch, family):
     return (
         total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
         total_vex_temps, num_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+        num_cfg_blocks, num_cfg_edges,
     )
 
 
@@ -306,6 +319,7 @@ def run(binary_path, outdir, limit):
                     (
                         n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts,
                         n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+                        n_cfg_blocks, n_cfg_edges,
                     ) = lift_function(proj, func, cs_arch, family)
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
@@ -314,6 +328,8 @@ def run(binary_path, outdir, limit):
                     record["num_escape_ops"] = n_escape_ops
                     record["max_nesting_depth"] = max_nesting_depth
                     record["sum_nesting_depth"] = sum_nesting_depth
+                    record["num_cfg_blocks"] = n_cfg_blocks
+                    record["num_cfg_edges"] = n_cfg_edges
                     record["op_histogram"] = dict(op_histogram)
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]

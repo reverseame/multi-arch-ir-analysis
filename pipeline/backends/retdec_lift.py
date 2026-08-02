@@ -36,6 +36,13 @@ from pipeline.common import (
 
 DSM_FUNCTION_RE = re.compile(r"^; function: (?P<name>\S+) at (?P<start>0x[0-9a-fA-F]+) -- (?P<end>0x[0-9a-fA-F]+)")
 LL_DEFINE_RE = re.compile(r"^define[^@]*@(?P<name>[\w.$]+)\s*\(")
+# LLVM's use-list serialization bookkeeping, not a real instruction -- can appear
+# inside a function's braces, would otherwise inflate its line count. Same
+# filter/rationale as pipeline/metrics/blocks/agnosticism.py's _LL_USELISTORDER_RE.
+# Also strips the "; uselistorder directives" section header that precedes them
+# (RetDec only emits it when the function has >=1 such directive, so leaving it
+# in would itself be a source-of-noise line count difference).
+LL_USELISTORDER_RE = re.compile(r"^\s*(uselistorder\b|; uselistorder directives\s*$)")
 
 
 def find_retdec_bin(explicit):
@@ -94,7 +101,8 @@ def split_ll_by_function(ll_path):
             j += 1
             if depth == 0 and j > start:
                 break
-        records[name] = j - start
+        num_lines = sum(1 for line in lines[start:j] if not LL_USELISTORDER_RE.match(line))
+        records[name] = num_lines
         i = j
     return records
 
@@ -113,9 +121,20 @@ def run(binary_path, outdir, limit, retdec_bin, timeout_s):
             # invoked only through function pointers) and functions it
             # recognizes as library code (e.g. PLT trampolines) -- both are
             # real functions we still want IR for, so keep them.
+            #
+            # We only ever read .dsm/.ll (bin2llvmir's output), never the .c
+            # file -- so llvmir2hll's cosmetic passes for making that .c
+            # readable (var renaming, symbolic-constant substitution, compound
+            # operators, its own opt passes) are pure wasted work here.
+            # Disabling them measured a ~6-7x speedup on real corpus binaries,
+            # verified to leave .dsm (function boundaries) and .ll (function
+            # bodies) unaffected but for uselistorder bookkeeping lines --
+            # see LL_USELISTORDER_RE above.
             cmd = [
                 retdec_bin, str(binary_path), "-o", str(output_c), "--cleanup",
                 "--keep-unreachable-funcs", "--backend-keep-library-funcs",
+                "--backend-no-opts", "--backend-no-var-renaming",
+                "--backend-no-symbolic-names", "--backend-no-compound-operators",
             ]
             print(f"Running: {' '.join(cmd)}")
 

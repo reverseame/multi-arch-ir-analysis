@@ -127,3 +127,23 @@ def aggregate_stats(values):
         "max": max(clean),
         "n": len(clean),
     }
+
+
+def aggregate_stats_with_iqr(values):
+    """aggregate_stats plus q1/q3 (IQR), additive rather than a replacement.
+
+    Kept separate from aggregate_stats -- every other metrics block reports
+    the plain mean/median/min/max/n shape, and this is only needed for
+    expansion_ratio's by_backend[backend]["by_arch"] breakdown so far.
+    """
+    stats = aggregate_stats(values)
+    if stats is None:
+        return None
+    clean = [v for v in values if v is not None]
+    if len(clean) == 1:
+        q1 = q3 = clean[0]
+    else:
+        q1, _, q3 = statistics.quantiles(clean, n=4, method="inclusive")
+    stats["q1"] = q1
+    stats["q3"] = q3
+    return stats

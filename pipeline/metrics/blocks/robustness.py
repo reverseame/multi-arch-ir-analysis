@@ -75,7 +75,7 @@ from pathlib import Path
 
 from pipeline.elf_bytes import ElfByteReader
 from pipeline.metrics.blocks.expansion_ratio import IR_SIZE_FIELDS, _load_lift_records
-from pipeline.metrics.formulas import aggregate_stats
+from pipeline.metrics.formulas import aggregate_stats, aggregate_stats_with_iqr
 from pipeline.metrics.registry import register_block
 from pipeline.native_classify import arch_family, classify_bytes, make_disassembler
 
@@ -173,18 +173,31 @@ def compute_error_rate(runs, results_dir):
 
     overall = {cat: [] for cat in CATEGORIES}
     by_backend = defaultdict(lambda: {cat: [] for cat in CATEGORIES})
+    by_backend_arch = defaultdict(lambda: defaultdict(lambda: {cat: [] for cat in CATEGORIES}))
+    # Errors concentrate in specific runs rather than spreading continuously
+    # across a group -- median/IQR on the per-category rates alone would
+    # hide that, so track how many of a (backend, arch, bits) group's
+    # attempted runs had *any* function-level error separately.
+    run_counts = defaultdict(lambda: defaultdict(lambda: {"n_runs": 0, "n_errors": 0}))
     rows = []
 
     for run in attempted:
         backend = run["backend"]
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
         ok_counts, error_counts = _run_native_category_counts(run)
+
+        if arch_bits is not None:
+            run_counts[backend][arch_bits]["n_runs"] += 1
+            if sum(error_counts.values()) > 0:
+                run_counts[backend][arch_bits]["n_errors"] += 1
 
         row = {
             "binary": Path(run["binary"]).name,
             "backend": backend,
-            "arch": meta.get("arch"),
-            "bits": meta.get("bits"),
+            "arch": arch,
+            "bits": bits,
             "opt": meta.get("opt"),
             "compiler": meta.get("compiler"),
         }
@@ -201,6 +214,8 @@ def compute_error_rate(runs, results_dir):
             any_rate = True
             overall[cat].append(rate)
             by_backend[backend][cat].append(rate)
+            if arch_bits is not None:
+                by_backend_arch[backend][arch_bits][cat].append(rate)
 
         if any_rate:
             rows.append(row)
@@ -215,7 +230,20 @@ def compute_error_rate(runs, results_dir):
             for cat in CATEGORIES
         },
         "by_backend": {
-            backend: {f"error_rate_{cat}": aggregate_stats(vals[cat]) for cat in CATEGORIES}
+            backend: {
+                **{f"error_rate_{cat}": aggregate_stats(vals[cat]) for cat in CATEGORIES},
+                "by_arch": {
+                    arch_bits: {
+                        **{
+                            f"error_rate_{cat}": aggregate_stats_with_iqr(by_backend_arch[backend][arch_bits][cat])
+                            for cat in CATEGORIES
+                        },
+                        "n_errors": counts["n_errors"],
+                        "n_runs": counts["n_runs"],
+                    }
+                    for arch_bits, counts in run_counts.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,
@@ -243,11 +271,14 @@ def compute_escape_fraction(runs, results_dir):
 
     overall = []
     by_backend = defaultdict(list)
+    by_backend_arch = defaultdict(lambda: defaultdict(list))
     rows = []
 
     for run in completed:
         backend = run["backend"]
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
 
         for record in _load_lift_records(run["outdir"]):
             if record.get("status") != "ok":
@@ -259,8 +290,8 @@ def compute_escape_fraction(runs, results_dir):
             rows.append({
                 "binary": Path(run["binary"]).name,
                 "backend": backend,
-                "arch": meta.get("arch"),
-                "bits": meta.get("bits"),
+                "arch": arch,
+                "bits": bits,
                 "opt": meta.get("opt"),
                 "compiler": meta.get("compiler"),
                 "function": record.get("function"),
@@ -269,6 +300,8 @@ def compute_escape_fraction(runs, results_dir):
             })
             overall.append(fraction)
             by_backend[backend].append(fraction)
+            if arch_bits is not None:
+                by_backend_arch[backend][arch_bits].append(fraction)
 
     return {
         "block": "escape_fraction",
@@ -279,7 +312,13 @@ def compute_escape_fraction(runs, results_dir):
             "escape_fraction": {**ESCAPE_METRICS["escape_fraction"], **(aggregate_stats(overall) or {"n": 0})},
         },
         "by_backend": {
-            backend: {"escape_fraction": aggregate_stats(vals)}
+            backend: {
+                "escape_fraction": aggregate_stats(vals),
+                "by_arch": {
+                    arch_bits: {"escape_fraction": aggregate_stats_with_iqr(arch_vals)}
+                    for arch_bits, arch_vals in by_backend_arch.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,

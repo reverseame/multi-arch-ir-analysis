@@ -67,7 +67,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from pipeline.metrics.blocks.expansion_ratio import _load_lift_records, _retdec_native_category_counts
-from pipeline.metrics.formulas import aggregate_stats, expansion_ratio
+from pipeline.metrics.formulas import aggregate_stats, aggregate_stats_with_iqr, expansion_ratio
 from pipeline.metrics.registry import register_block
 
 METRICS = {
@@ -124,11 +124,14 @@ def compute(runs, results_dir):
 
     overall = []
     by_backend = defaultdict(list)
+    by_backend_arch = defaultdict(lambda: defaultdict(list))
     rows = []
 
     for run in completed:
         backend = run["backend"]
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
 
         retdec_temp_counts = retdec_native_counts = None
         if backend == "retdec":
@@ -156,8 +159,8 @@ def compute(runs, results_dir):
             rows.append({
                 "binary": Path(run["binary"]).name,
                 "backend": backend,
-                "arch": meta.get("arch"),
-                "bits": meta.get("bits"),
+                "arch": arch,
+                "bits": bits,
                 "opt": meta.get("opt"),
                 "compiler": meta.get("compiler"),
                 "function": function,
@@ -167,6 +170,8 @@ def compute(runs, results_dir):
             })
             overall.append(ratio)
             by_backend[backend].append(ratio)
+            if arch_bits is not None:
+                by_backend_arch[backend][arch_bits].append(ratio)
 
     return {
         "block": "temporaries",
@@ -177,7 +182,13 @@ def compute(runs, results_dir):
             "temp_vars_per_instr": {**METRICS["temp_vars_per_instr"], **(aggregate_stats(overall) or {"n": 0})},
         },
         "by_backend": {
-            backend: {"temp_vars_per_instr": aggregate_stats(vals)}
+            backend: {
+                "temp_vars_per_instr": aggregate_stats(vals),
+                "by_arch": {
+                    arch_bits: {"temp_vars_per_instr": aggregate_stats_with_iqr(arch_vals)}
+                    for arch_bits, arch_vals in by_backend_arch.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,

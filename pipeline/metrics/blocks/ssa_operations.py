@@ -56,7 +56,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from pipeline.metrics.blocks.expansion_ratio import _load_lift_records
-from pipeline.metrics.formulas import aggregate_stats, expansion_ratio
+from pipeline.metrics.formulas import aggregate_stats, aggregate_stats_with_iqr, expansion_ratio
 from pipeline.metrics.registry import register_block
 
 # Which backends have a real SSA-form alternate view (see module docstring),
@@ -81,12 +81,15 @@ def compute(runs, results_dir):
 
     overall = {key: [] for key in METRICS}
     by_backend = defaultdict(lambda: {key: [] for key in METRICS})
+    by_backend_arch = defaultdict(lambda: defaultdict(lambda: {key: [] for key in METRICS}))
     rows = []
 
     for run in completed:
         backend = run["backend"]
         ops_field = OPS_FIELDS[backend]
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
 
         for record in _load_lift_records(run["outdir"]):
             if record.get("status") != "ok":
@@ -102,8 +105,8 @@ def compute(runs, results_dir):
             rows.append({
                 "binary": Path(run["binary"]).name,
                 "backend": backend,
-                "arch": meta.get("arch"),
-                "bits": meta.get("bits"),
+                "arch": arch,
+                "bits": bits,
                 "opt": meta.get("opt"),
                 "compiler": meta.get("compiler"),
                 "function": function,
@@ -115,6 +118,9 @@ def compute(runs, results_dir):
             overall["ssa_expansion_ratio"].append(ratio)
             by_backend[backend]["num_ssa_instructions"].append(n_ssa)
             by_backend[backend]["ssa_expansion_ratio"].append(ratio)
+            if arch_bits is not None:
+                by_backend_arch[backend][arch_bits]["num_ssa_instructions"].append(n_ssa)
+                by_backend_arch[backend][arch_bits]["ssa_expansion_ratio"].append(ratio)
 
     return {
         "block": "ssa_operations",
@@ -126,7 +132,13 @@ def compute(runs, results_dir):
             for key in METRICS
         },
         "by_backend": {
-            backend: {key: aggregate_stats(vals[key]) for key in METRICS}
+            backend: {
+                **{key: aggregate_stats(vals[key]) for key in METRICS},
+                "by_arch": {
+                    arch_bits: {key: aggregate_stats_with_iqr(arch_vals[key]) for key in METRICS}
+                    for arch_bits, arch_vals in by_backend_arch.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,

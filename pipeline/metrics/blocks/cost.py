@@ -19,7 +19,7 @@ wall time reflects how it died, not how long lifting takes.
 from collections import defaultdict
 from pathlib import Path
 
-from pipeline.metrics.formulas import aggregate_stats
+from pipeline.metrics.formulas import aggregate_stats, aggregate_stats_with_iqr
 from pipeline.metrics.registry import register_block
 
 METRICS = {
@@ -44,16 +44,19 @@ def compute(runs, results_dir):
 
     overall = defaultdict(list)
     by_backend = defaultdict(lambda: defaultdict(list))
+    by_backend_arch = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     rows = []
 
     for run in completed:
         values = _run_values(run)
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
         rows.append({
             "binary": Path(run["binary"]).name,
             "backend": run["backend"],
-            "arch": meta.get("arch"),
-            "bits": meta.get("bits"),
+            "arch": arch,
+            "bits": bits,
             "opt": meta.get("opt"),
             "compiler": meta.get("compiler"),
             **values,
@@ -63,6 +66,8 @@ def compute(runs, results_dir):
                 continue
             overall[metric].append(value)
             by_backend[run["backend"]][metric].append(value)
+            if arch_bits is not None:
+                by_backend_arch[run["backend"]][arch_bits][metric].append(value)
 
     return {
         "block": "cost",
@@ -73,7 +78,13 @@ def compute(runs, results_dir):
             for name, spec in METRICS.items()
         },
         "by_backend": {
-            backend: {name: aggregate_stats(vals[name]) for name in METRICS}
+            backend: {
+                **{name: aggregate_stats(vals[name]) for name in METRICS},
+                "by_arch": {
+                    arch_bits: {name: aggregate_stats_with_iqr(arch_vals[name]) for name in METRICS}
+                    for arch_bits, arch_vals in by_backend_arch.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,

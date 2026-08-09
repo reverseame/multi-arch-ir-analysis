@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -115,6 +116,69 @@ def default_python():
         if candidate.exists():
             return str(candidate)
     return sys.executable
+
+
+def load_pause_state(state_path):
+    if state_path.exists():
+        try:
+            return json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+class PauseController:
+    """Lets the user pause the run interactively; survives crashes/reboots via a state file.
+
+    Pausing cancels every not-yet-started future (Future.cancel() only succeeds before a
+    worker picks the task up), so in-flight subprocesses always run to completion while no
+    new ones are dispatched. The state file records the pause so a fresh process comes back 
+    up still paused until the user passes --resume.
+    """
+
+    def __init__(self, state_path, state):
+        self.state_path = state_path
+        self.state = state
+        self.event = threading.Event()
+        self.futures = {}
+        self._lock = threading.Lock()
+
+    def attach(self, futures):
+        self.futures = futures
+        if self.event.is_set():
+            self._cancel_pending()
+
+    def _cancel_pending(self):
+        return sum(1 for fut in list(self.futures) if fut.cancel())
+
+    def request_pause(self, source):
+        with self._lock:
+            first = not self.event.is_set()
+            self.event.set()
+        cancelled = self._cancel_pending()
+        if first:
+            self.state["paused"] = True
+            self.state["paused_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            write_json(self.state_path, self.state)
+        print(f"\n>>> Pause requested ({source}): {cancelled} not-yet-started job(s) cancelled; "
+              f"in-flight jobs will finish normally. <<<", flush=True)
+
+
+def not_started_record(binary, backend, outdir):
+    return {
+        "binary": str(binary), "backend": backend, "outdir": str(outdir),
+        "status": "not_started", "returncode": None,
+        "wall_time_s": None, "max_rss_kb": None, "summary": None,
+    }
+
+
+def stdin_pause_listener(controller):
+    try:
+        for line in sys.stdin:
+            if line.strip().lower() in ("p", "pause"):
+                controller.request_pause("keypress")
+    except (OSError, ValueError):
+        pass
 
 
 def run_subprocess_with_rusage(cmd, cwd, timeout_s, stdout_path, stderr_path):
@@ -246,7 +310,14 @@ def main():
                               "large corpus across multiple sessions -- errors/timeouts are NOT considered "
                               "done and will be retried. Off by default: a bare rerun still overwrites "
                               "everything it's given, per this project's usual explicit-rerun convention.")
+    parser.add_argument("--resume", action="store_true",
+                         help="Clear a previously-triggered pause (see pause_state.json in "
+                              "--results-dir) and continue. Implies --skip-existing so completed "
+                              "(binary, backend) pairs aren't redone. A no-op if the run wasn't paused.")
     args = parser.parse_args()
+
+    if args.resume:
+        args.skip_existing = True
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     unknown = set(backends) - set(BACKENDS)
@@ -281,6 +352,29 @@ def main():
 
     python_exe = args.python or default_python()
     ensure_dir(args.results_dir)
+
+    state_path = args.results_dir / "pause_state.json"
+    state = load_pause_state(state_path)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if not state:
+        state = {"run_started_at": now_iso, "paused": False, "paused_at": None, "resumed_at": None}
+        write_json(state_path, state)
+
+    if state.get("paused") and not args.resume:
+        print(f"Pipeline is PAUSED (paused at {state.get('paused_at')}; first started "
+              f"{state.get('run_started_at')}). State file: {state_path}")
+        print("No new jobs will start. Rerun with --resume to continue "
+              "(it also turns on --skip-existing so finished work isn't redone).")
+        return 3
+
+    if state.get("paused") and args.resume:
+        state["paused"] = False
+        state["resumed_at"] = now_iso
+        write_json(state_path, state)
+        print(f"Resuming (first started {state.get('run_started_at')}, "
+              f"was paused at {state.get('paused_at')}).")
+
+    controller = PauseController(state_path, state)
 
     if args.max_mem_mb is not None:
         mem_budget_mb = args.max_mem_mb
@@ -340,8 +434,17 @@ def main():
         outdir = binary_dirs[binary] / backend
         mem_mb = BACKEND_MEM_ESTIMATE_MB.get(backend, DEFAULT_BACKEND_MEM_ESTIMATE_MB)
 
+        # A worker thread can already be dispatched (so its Future reads RUNNING and
+        # Future.cancel() refuses it) while still blocked here waiting for memory --
+        # that's not an in-flight job yet, just a queued one that hasn't launched its
+        # subprocess.
+        if controller.event.is_set():
+            return not_started_record(binary, backend, outdir)
+
         mem_budget.acquire(mem_mb)
         try:
+            if controller.event.is_set():
+                return not_started_record(binary, backend, outdir)
             return run_one(python_exe, backend, module, binary, outdir,
                             args.limit, args.timeout, args.retdec_bin)
         finally:
@@ -361,32 +464,57 @@ def main():
     binja_jobs = [(b, be) for b, be in jobs_to_run if be in BACKEND_LICENSE_GROUP]
     other_jobs = [(b, be) for b, be in jobs_to_run if be not in BACKEND_LICENSE_GROUP]
 
+    pid_path = args.results_dir / "pipeline.pid"
+    pid_path.write_text(str(os.getpid()))
+
+    threading.Thread(target=stdin_pause_listener, args=(controller,), daemon=True).start()
+    signal.signal(signal.SIGUSR1, lambda signum, frame: controller.request_pause("SIGUSR1"))
+    print(f"Pause control: type 'p' + Enter in this terminal, or run `kill -USR1 {os.getpid()}`, "
+          f"to stop starting new jobs once in-flight ones finish (state: {state_path}).")
+
     results_by_job = dict(skipped_records)
     with ThreadPoolExecutor(max_workers=args.max_parallel) as main_pool, \
             ThreadPoolExecutor(max_workers=1) as binja_pool:
         futures = {main_pool.submit(run_job, binary, backend): (binary, backend) for binary, backend in other_jobs}
         futures.update({binja_pool.submit(run_job, binary, backend): (binary, backend) for binary, backend in binja_jobs})
+        controller.attach(futures)
+
         for future in as_completed(futures):
             job = futures[future]
-            results_by_job[job] = future.result()
+            if future.cancelled():
+                binary, backend = job
+                results_by_job[job] = not_started_record(binary, backend, binary_dirs[binary] / backend)
+            else:
+                results_by_job[job] = future.result()
+
+    pid_path.unlink(missing_ok=True)
 
     runs = [results_by_job[job] for job in jobs]
+    paused = controller.event.is_set()
 
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "num_binaries": len(binaries),
         "backends": backends,
+        "complete": not paused,
         "runs": runs,
     }
     write_json(args.results_dir / "manifest.json", manifest)
 
     print("\n--- Summary ---")
     ok = sum(1 for r in runs if r["status"] == "ok")
+    not_started = sum(1 for r in runs if r["status"] == "not_started")
     print(f"{ok}/{len(runs)} runs completed successfully")
     for r in runs:
         if r["status"] != "ok":
-            print(f"  {r['status'].upper():8s} {Path(r['binary']).name} :: {r['backend']}")
+            print(f"  {r['status'].upper():12s} {Path(r['binary']).name} :: {r['backend']}")
     print(f"Manifest: {args.results_dir / 'manifest.json'}")
+
+    if paused:
+        print(f"\nPipeline PAUSED: {not_started} job(s) not started, {ok}/{len(runs)} ok so far.")
+        print(f"To continue: rerun the same command with --resume added "
+              f"(--results-dir {args.results_dir}).")
+        return 3
 
     return 0
 

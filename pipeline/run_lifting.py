@@ -58,18 +58,12 @@ BACKEND_MEM_ESTIMATE_MB = {
 }
 DEFAULT_BACKEND_MEM_ESTIMATE_MB = 1000
 
-# Binary Ninja's license on this machine is confirmed single-seat (count: 1
-# in ~/.binaryninja/license.dat), so the 3 IL variants are serialized to 1
-# concurrent instance regardless of --max-parallel/--max-mem-mb. ida was
-# under the same conservative assumption, but running 2 idalib processes
-# concurrently (2026-07-31 smoke test, grep_x86 + ls_arm) completed cleanly
-# with no license/lock errors, just ordinary CPU contention -- so ida is not
-# gated here.
 BACKEND_LICENSE_GROUP = {
     "binja_llil": "binja",
     "binja_mlil": "binja",
     "binja_hlil": "binja",
 }
+BINJA_POOL_WORKERS = 3
 
 DEFAULT_PYTHON_CANDIDATES = [REPO_ROOT / "bin" / "python3", Path(sys.executable)]
 
@@ -386,9 +380,16 @@ def main():
     print(f"Binaries ({len(binaries)}):")
     for b in binaries:
         print(f"  {b}")
+    # BINJA_POOL_WORKERS is a license-safety ceiling (the most concurrency actually
+    # tested), not a target -- it never scales up with --max-parallel. But it does
+    # scale down, so --max-parallel 1 genuinely restores fully-sequential behavior
+    # (per that flag's own help text) instead of leaving binja at a fixed 3.
+    binja_workers = min(BINJA_POOL_WORKERS, args.max_parallel)
+
     print(f"Backends: {', '.join(backends)}")
-    print(f"Scheduling: max_parallel={args.max_parallel} + 1 dedicated binja worker, "
-          f"mem_budget={mem_budget_mb:.0f}MB (binja capped to 1 concurrent instance)")
+    print(f"Scheduling: max_parallel={args.max_parallel} + {binja_workers} dedicated binja "
+          f"worker(s), mem_budget={mem_budget_mb:.0f}MB (binja capped to "
+          f"{binja_workers} concurrent instances)")
 
     binary_dirs = {}
     for binary in binaries:
@@ -450,17 +451,12 @@ def main():
         finally:
             mem_budget.release(mem_mb)
 
-    # binja jobs go to their own dedicated 1-worker pool instead of a lock
-    # inside the shared pool. A lock would have a worker thread dequeue a
-    # blocked binja_mlil/hlil job and then just sit there blocked for the
-    # whole wait, wasting one of --max-parallel's worker slots the entire
-    # time another binja job is running (confirmed via the 2026-07-31 14-
-    # binary batch: jobs ran almost fully serial per-binary, only 1.5x
-    # speedup, because 2-3 of the 4 workers were perpetually stuck blocked
-    # on this exact lock). A separate single-worker pool serializes binja
-    # jobs among themselves for free (only one worker to hand them to) while
-    # never touching the main pool's workers, so pyghidra/r2/angr/retdec/ida
-    # actually run concurrently with whatever binja is doing.
+    # binja jobs go to their own dedicated binja_workers-worker pool instead
+    # of a lock inside the shared pool. A separate small dedicated pool 
+    # serializes binja jobs to at most binja_workers among themselves for free 
+    #(only that many workers to hand them to) while never touching the main pool's
+    # workers, so pyghidra/r2/angr/retdec/ida actually run concurrently with
+    # whatever binja is doing.
     binja_jobs = [(b, be) for b, be in jobs_to_run if be in BACKEND_LICENSE_GROUP]
     other_jobs = [(b, be) for b, be in jobs_to_run if be not in BACKEND_LICENSE_GROUP]
 
@@ -474,7 +470,7 @@ def main():
 
     results_by_job = dict(skipped_records)
     with ThreadPoolExecutor(max_workers=args.max_parallel) as main_pool, \
-            ThreadPoolExecutor(max_workers=1) as binja_pool:
+            ThreadPoolExecutor(max_workers=binja_workers) as binja_pool:
         futures = {main_pool.submit(run_job, binary, backend): (binary, backend) for binary, backend in other_jobs}
         futures.update({binja_pool.submit(run_job, binary, backend): (binary, backend) for binary, backend in binja_jobs})
         controller.attach(futures)

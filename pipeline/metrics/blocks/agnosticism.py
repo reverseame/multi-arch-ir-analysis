@@ -47,6 +47,12 @@ Every metric is reported three ways: an overall aggregate, broken down
 by_backend, and broken down by_arch_pair (e.g. "arm_32_vs_x86_32") -- the
 interesting agnosticism signal is expected to show up in *which*
 architecture pair diverges, not just the overall mean.
+
+by_arch_pair is not one homogeneous thing, though: GROUP_META_KEYS doesn't
+include bits, so within one group's by_arch dict, a pair's two (arch, bits)
+labels can differ in architecture, bit-width, or both -- with this
+project's corpus (4 archs x 2 bit-widths = 8 labels per group), that's
+C(8,2) = 28 pairs.
 """
 
 import itertools
@@ -57,6 +63,7 @@ from pathlib import Path
 from pipeline.metrics.blocks.expansion_ratio import IR_SIZE_FIELDS, _iter_ll_functions, _ll_line_opcode, _load_lift_records
 from pipeline.metrics.formulas import (
     aggregate_stats,
+    aggregate_stats_with_iqr,
     coefficient_of_variation,
     cyclomatic_complexity,
     jensen_shannon_similarity,
@@ -77,6 +84,46 @@ def _arch_label(meta):
 
 def _arch_pair_label(label_a, label_b):
     return "_vs_".join(sorted((label_a, label_b)))
+
+
+def classify_arch_pair(pair_label):
+    """Classify a by_arch_pair key ("{arch}_{bits}_vs_{arch}_{bits}", e.g.
+    "arm_32_vs_x86_64", as produced by _arch_pair_label) by which factor(s)
+    differ between its two (arch, bits) labels.
+    """
+    label_a, label_b = pair_label.split("_vs_")
+    arch_a, bits_a = label_a.rsplit("_", 1)
+    arch_b, bits_b = label_b.rsplit("_", 1)
+    if bits_a == bits_b:
+        return "pure_arch"
+    if arch_a == arch_b:
+        return "pure_bits"
+    return "confounded"
+
+
+def _by_pair_type(by_pair_backend):
+    """by_pair_type -> {pure_arch, pure_bits, confounded} -> by_backend ->
+    aggregate_stats_with_iqr, purely a reclassification of by_arch_pair's
+    already-computed per-(pair, backend) raw value lists via
+    classify_arch_pair -- no recomputation from the underlying
+    histograms/CFGs.
+    """
+    grouped = {
+        "pure_arch": defaultdict(list),
+        "pure_bits": defaultdict(list),
+        "confounded": defaultdict(list),
+    }
+    for pair_label, vals_by_backend in by_pair_backend.items():
+        category = classify_arch_pair(pair_label)
+        for backend, vals in vals_by_backend.items():
+            grouped[category][backend].extend(vals)
+    return {
+        category: {
+            backend: aggregate_stats_with_iqr(vals)
+            for backend, vals in vals_by_backend.items()
+        }
+        for category, vals_by_backend in grouped.items()
+    }
 
 
 # A bare LLVM-IR basic-block label line ("entry:", "if.then:", "16:", optionally
@@ -296,6 +343,7 @@ def compute_weighted_jaccard(runs, results_dir):
     overall = []
     by_backend = defaultdict(list)
     by_arch_pair = defaultdict(list)
+    by_pair_backend = defaultdict(lambda: defaultdict(list))
     match_rates_overall = []
     match_rates_by_pair = defaultdict(list)
     rows = []
@@ -341,6 +389,7 @@ def compute_weighted_jaccard(runs, results_dir):
                 overall.append(wj)
                 by_backend[backend].append(wj)
                 by_arch_pair[pair_label].append(wj)
+                by_pair_backend[pair_label][backend].append(wj)
 
     return {
         "block": "weighted_jaccard",
@@ -367,6 +416,7 @@ def compute_weighted_jaccard(runs, results_dir):
             }
             for pair, vals in by_arch_pair.items()
         },
+        "by_pair_type": _by_pair_type(by_pair_backend),
         "rows": rows,
     }
 
@@ -386,6 +436,7 @@ def compute_jsd_similarity(runs, results_dir):
     overall = []
     by_backend = defaultdict(list)
     by_arch_pair = defaultdict(list)
+    by_pair_backend = defaultdict(lambda: defaultdict(list))
     match_rates_overall = []
     match_rates_by_pair = defaultdict(list)
     rows = []
@@ -431,6 +482,7 @@ def compute_jsd_similarity(runs, results_dir):
                 overall.append(jsd)
                 by_backend[backend].append(jsd)
                 by_arch_pair[pair_label].append(jsd)
+                by_pair_backend[pair_label][backend].append(jsd)
 
     return {
         "block": "jsd_similarity",
@@ -457,6 +509,7 @@ def compute_jsd_similarity(runs, results_dir):
             }
             for pair, vals in by_arch_pair.items()
         },
+        "by_pair_type": _by_pair_type(by_pair_backend),
         "rows": rows,
     }
 
@@ -476,6 +529,7 @@ def compute_ir_size_cv(runs, results_dir):
     overall = []
     by_backend = defaultdict(list)
     by_arch_pair = defaultdict(list)
+    by_pair_backend = defaultdict(lambda: defaultdict(list))
     match_rates_overall = []
     match_rates_by_pair = defaultdict(list)
     rows = []
@@ -521,6 +575,7 @@ def compute_ir_size_cv(runs, results_dir):
                 overall.append(cv)
                 by_backend[backend].append(cv)
                 by_arch_pair[pair_label].append(cv)
+                by_pair_backend[pair_label][backend].append(cv)
 
     return {
         "block": "ir_size_cv",
@@ -547,6 +602,7 @@ def compute_ir_size_cv(runs, results_dir):
             }
             for pair, vals in by_arch_pair.items()
         },
+        "by_pair_type": _by_pair_type(by_pair_backend),
         "rows": rows,
     }
 
@@ -566,6 +622,7 @@ def compute_cyclomatic_complexity_delta(runs, results_dir):
     overall = []
     by_backend = defaultdict(list)
     by_arch_pair = defaultdict(list)
+    by_pair_backend = defaultdict(lambda: defaultdict(list))
     match_rates_overall = []
     match_rates_by_pair = defaultdict(list)
     rows = []
@@ -613,6 +670,7 @@ def compute_cyclomatic_complexity_delta(runs, results_dir):
                 overall.append(delta)
                 by_backend[backend].append(delta)
                 by_arch_pair[pair_label].append(delta)
+                by_pair_backend[pair_label][backend].append(delta)
 
     return {
         "block": "cyclomatic_complexity_delta",
@@ -639,5 +697,6 @@ def compute_cyclomatic_complexity_delta(runs, results_dir):
             }
             for pair, vals in by_arch_pair.items()
         },
+        "by_pair_type": _by_pair_type(by_pair_backend),
         "rows": rows,
     }

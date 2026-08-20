@@ -488,14 +488,29 @@ def main():
     runs = [results_by_job[job] for job in jobs]
     paused = controller.event.is_set()
 
+    # Merge into any manifest.json already on disk instead of overwriting it: a
+    # --resume (or a later invocation scoped to a different --binary subset,
+    # e.g. run_batch.sh-style batches against the same --results-dir).
+    manifest_path = args.results_dir / "manifest.json"
+    existing_manifest = {}
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            existing_manifest = {}
+
+    merged_by_job = {(r["binary"], r["backend"]): r for r in existing_manifest.get("runs", [])}
+    merged_by_job.update({(str(binary), backend): results_by_job[(binary, backend)] for binary, backend in jobs})
+    merged_runs = [merged_by_job[key] for key in sorted(merged_by_job)]
+
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "num_binaries": len(binaries),
-        "backends": backends,
-        "complete": not paused,
-        "runs": runs,
+        "num_binaries": len({r["binary"] for r in merged_runs}),
+        "backends": sorted({r["backend"] for r in merged_runs}),
+        "complete": not paused and not any(r["status"] == "not_started" for r in merged_runs),
+        "runs": merged_runs,
     }
-    write_json(args.results_dir / "manifest.json", manifest)
+    write_json(manifest_path, manifest)
 
     print("\n--- Summary ---")
     ok = sum(1 for r in runs if r["status"] == "ok")
@@ -504,7 +519,8 @@ def main():
     for r in runs:
         if r["status"] != "ok":
             print(f"  {r['status'].upper():12s} {Path(r['binary']).name} :: {r['backend']}")
-    print(f"Manifest: {args.results_dir / 'manifest.json'}")
+    print(f"Manifest: {manifest_path} ({len(merged_runs)} total runs on record, "
+          f"{len(runs)} touched this invocation)")
 
     if paused:
         print(f"\nPipeline PAUSED: {not_started} job(s) not started, {ok}/{len(runs)} ok so far.")

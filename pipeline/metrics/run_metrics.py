@@ -62,7 +62,14 @@ def write_block_output(outdir, name, summary):
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            f.flush()
+            # Flushed one row at a time (rather than writerows' single bulk
+            # write) to avoid the same OSError as write_whole_binary_dump --
+            # shared-folder mounts (vboxsf) corrupt the raw write() return
+            # value once the buffered payload gets large enough.
+            for row in rows:
+                writer.writerow(row)
+                f.flush()
     return csv_path
 
 

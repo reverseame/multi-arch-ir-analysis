@@ -12,7 +12,7 @@ after stripping the level's own prefix, covers all three levels instead of
 duplicating near-identical tables three times.
 
 Two classification granularities are provided, both used by expansion-ratio
-metrics (pipeline/metrics/blocks/verbosity.py):
+metrics (pipeline/metrics/blocks/expansion_ratio.py):
 
   - classify_il_function_ops: one label per top-level instruction only
     (`il_func.instructions`) -- the same counting unit as
@@ -37,11 +37,30 @@ a value rather than compute a new one.
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from binaryninja import VariableSourceType
+
 from pipeline.native_classify import arch_family, classify_bytes, cs_arch_for, make_disassembler
+
+# LLIL temp registers/flags are encoded with their high bit set (see
+# binaryninja.lowlevelil.ILRegister.temp/ILFlag.temp); MLIL/HLIL have no
+# temp_reg_count-style helper of their own, but Binary Ninja promotes an
+# unresolved LLIL temp into a full Variable that keeps that same encoding in
+# its .storage field so MLIL/HLIL temps are detected via that bit
+# instead of a level-specific API.
+_TEMP_STORAGE_BIT = 0x80000000
+
+
+def is_bnil_temp_var(v):
+    """True if MLIL/HLIL Variable `v` is Binary Ninja's promoted form of an
+    unresolved LLIL temp register (temp#N), not a real named/recovered local
+    or parameter. See module-level comment above for how this is encoded.
+    """
+    return v.source_type == VariableSourceType.RegisterVariableSourceType and bool(v.storage & _TEMP_STORAGE_BIT)
 
 _ARITH_SUFFIXES = {
     "ADD", "ADC", "SUB", "SBB",
@@ -94,6 +113,14 @@ _ASSIGN_SUFFIXES = {
     "ASSIGN", "ASSIGN_UNPACK",
 }
 
+# Escape-valve metric: INTRINSIC is BNIL's own generic fallback for
+# instructions Binary Ninja's own IL can't express as primitive operations
+# and instead models as an opaque call to a named architecture-specific
+# intrinsic (e.g. x86 CPUID, ARM NEON/coprocessor ops) -- the closest BNIL
+# analog to P-code's CALLOTHER / VEX's Ist_Dirty. See
+# pipeline/metrics/blocks/robustness.py's escape_fraction.
+_ESCAPE_SUFFIXES = {"INTRINSIC", "INTRINSIC_SSA", "MEMORY_INTRINSIC_SSA", "MEMORY_INTRINSIC_OUTPUT_SSA"}
+
 _LEVEL_PREFIXES = ("LLIL_", "MLIL_", "HLIL_")
 
 
@@ -133,6 +160,28 @@ def classify_il_instruction_ops(instr):
     return classify_il_operation(instr.operation.name)
 
 
+def is_il_instruction_escape(instr):
+    """One top-level IL instruction -> True if it's (or wraps, via the same
+    assign-inheritance as classify_il_instruction_ops) BNIL's INTRINSIC
+    escape-valve operation -- e.g. `var = __intrinsic(...)` is one
+    LLIL_SET_REG instruction wrapping a nested LLIL_INTRINSIC, the same
+    inheritance classify_il_instruction_ops already applies for arithmetic/
+    control/memory.
+    """
+    suffix = _il_suffix(instr.operation.name)
+    if suffix in _ASSIGN_SUFFIXES:
+        suffix = _il_suffix(instr.src.operation.name)
+    return suffix in _ESCAPE_SUFFIXES
+
+
+def classify_il_function_escape(il_func):
+    """Count of top-level instructions in `il_func` that are BNIL's
+    INTRINSIC escape valve -- the ops-level granularity, same counting unit
+    as num_{llil,mlil,hlil}_instructions (see classify_il_function_ops).
+    """
+    return sum(1 for instr in il_func.instructions if is_il_instruction_escape(instr))
+
+
 def classify_il_function_ops(il_func):
     """{"arithmetic": n, "control": n, "memory": n, "other": n} over every
     top-level instruction in `il_func` (LLIL/MLIL/HLIL) only -- the ops-level
@@ -155,6 +204,74 @@ def classify_il_function_ast(il_func):
     for operation in il_func.traverse(lambda instr: instr.operation):
         counts[classify_il_operation(operation.name)] += 1
     return counts
+
+
+def classify_il_function_op_histogram(il_func):
+    """{operation_name: count} (e.g. "LLIL_ADD" -> 12) over every instruction
+    and sub-expression in `il_func`, via the same il_func.traverse() as
+    classify_il_function_ast -- but keyed by the raw operation name instead
+    of collapsed into arithmetic/control/memory/other.
+
+    Used by the agnosticism metrics' weighted Jaccard (see
+    pipeline/metrics/blocks/agnosticism.py) to compare op-frequency
+    distributions across architecture builds of the same IR level. Kept at
+    full op-name granularity (not suffix-stripped like classify_il_operation
+    does) because agnosticism only ever compares within one IR level at a
+    time, where the level prefix is already shared and doesn't need
+    normalizing away.
+    """
+    counts = Counter()
+    for operation in il_func.traverse(lambda instr: instr.operation):
+        counts[operation.name] += 1
+    return counts
+
+
+# Structural (nested statement *block*) operand names, not expression
+# operands -- matches HighLevelILInstruction.traverse()'s own default
+# (shallow=True) blacklist (see binaryninja/highlevelil.py). Only relevant
+# for HLIL, which has structured control flow (WHILE/DO_WHILE/FOR/SWITCH/
+# IF-as-block); LLIL/MLIL's IF/GOTO targets are plain basic-block-index
+# ints, never nested instruction lists, so this is a no-op for them.
+# Without this, a HLIL_WHILE's "body" operand (its entire loop body, often
+# dozens of unrelated statements) would count as expression nesting inside
+# the while-statement's own depth.
+_STRUCTURAL_OPERAND_NAMES = {"true", "false", "body", "cases", "default"}
+
+
+def bnil_instruction_depth(instr):
+    """How many levels deep `instr`'s own expression tree nests -- 1 for a
+    leaf/flat instruction with no nested instruction-valued operand, +1 for
+    each level of embedded sub-expression (e.g. "eax = 4" is depth 1, "eax =
+    ebx + 4" is depth 2: the SET_REG/SET_VAR/VAR_INIT's own node plus the
+    ADD nested inside it).
+    """
+    max_child_depth = 0
+    for name, op, _ in instr.detailed_operands:
+        if name in _STRUCTURAL_OPERAND_NAMES:
+            continue
+        if hasattr(op, "detailed_operands"):
+            max_child_depth = max(max_child_depth, bnil_instruction_depth(op))
+        elif isinstance(op, list):
+            for item in op:
+                if hasattr(item, "detailed_operands"):
+                    max_child_depth = max(max_child_depth, bnil_instruction_depth(item))
+    return 1 + max_child_depth
+
+
+def il_function_cfg_counts(il_func):
+    """(num_blocks, num_edges) over `il_func`'s (LLIL/MLIL/HLIL) own
+    basic-block-level control-flow graph. `il_func.basic_blocks` lists each
+    IL-level basic block (the same block granularity classify_native_
+    instructions already walks via the native Function.basic_blocks below);
+    each block's `.outgoing_edges` gives its own real successor edges (one
+    per branch target, including a plain unconditional fallthrough) -- used
+    by the agnosticism metrics' cyclomatic_complexity_delta (see
+    pipeline/metrics/blocks/agnosticism.py) via the standard M = E - N + 2
+    formula.
+    """
+    blocks = list(il_func.basic_blocks)
+    num_edges = sum(len(bb.outgoing_edges) for bb in blocks)
+    return len(blocks), num_edges
 
 
 # --- native-instruction classification (shared with the other 4 backends

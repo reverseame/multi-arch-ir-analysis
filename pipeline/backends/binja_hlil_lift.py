@@ -21,9 +21,14 @@ from pipeline.common import (
     write_whole_binary_dump,
 )
 from pipeline.binja_il_classify import (
+    bnil_instruction_depth,
     classify_il_function_ast,
+    classify_il_function_escape,
+    classify_il_function_op_histogram,
     classify_il_function_ops,
     classify_native_instructions,
+    il_function_cfg_counts,
+    is_bnil_temp_var,
 )
 
 from binaryninja import load
@@ -48,16 +53,51 @@ def lift_function(func, bv):
     hlil = func.hlil
     lines = [f"; ---- function {func.name} @ {hex(func.start)} ----"]
     num_instructions = 0
+    max_nesting_depth = 0
+    sum_nesting_depth = 0
     for insn in hlil.instructions:
         lines.append(f"  0x{insn.address:x}  {insn}")
         num_instructions += 1
+        # Nesting-depth metric: how deep this one instruction's own
+        # expression tree goes (see binja_il_classify.bnil_instruction_depth).
+        # HLIL is where this is most informative.
+        depth = bnil_instruction_depth(insn)
+        max_nesting_depth = max(max_nesting_depth, depth)
+        sum_nesting_depth += depth
     text = "\n".join(lines)
     # func.instructions for expansion ratio.
     num_native_instructions = sum(1 for _ in func.instructions)
     ir_ops_counts = classify_il_function_ops(hlil)
     ir_ast_counts = classify_il_function_ast(hlil)
     native_counts = classify_native_instructions(func, bv)
-    return num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
+    # Temporaries metric: same promoted-Variable encoding as MLIL (see
+    # pipeline/binja_il_classify.is_bnil_temp_var) -- expect this to be small
+    # and often zero, since HLIL's expression-inlining eliminates most
+    # surviving MLIL temps.
+    num_temp_vars = sum(1 for v in hlil.vars if is_bnil_temp_var(v))
+    # Escape-valve metric: see pipeline/binja_il_classify.py's
+    # classify_il_function_escape / pipeline/metrics/blocks/robustness.py.
+    num_escape_ops = classify_il_function_escape(hlil)
+    # SSA-operations metric: hlil.ssa_form is a cheap, already-computed
+    # alternate view of this same function.
+    num_ssa_instructions = sum(1 for _ in hlil.ssa_form.instructions)
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard.
+    op_histogram = classify_il_function_op_histogram(hlil)
+    # Cyclomatic-complexity metric: see pipeline/binja_il_classify.py's
+    # il_function_cfg_counts / pipeline/metrics/blocks/agnosticism.py's
+    # cyclomatic_complexity_delta. HLIL's basic-block graph is the same
+    # underlying block structure as LLIL/MLIL (Binary Ninja's control-flow
+    # structuring into if/while/for is a *rendering* of this same graph, not
+    # a replacement for it -- il_func.basic_blocks/outgoing_edges are still
+    # exposed at HLIL the same way).
+    num_cfg_blocks, num_cfg_edges = il_function_cfg_counts(hlil)
+    return (
+        num_instructions, num_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
+        num_temp_vars, num_escape_ops, max_nesting_depth, sum_nesting_depth, num_ssa_instructions,
+        op_histogram, text, num_cfg_blocks, num_cfg_edges,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -86,10 +126,22 @@ def run(binary_path, outdir, limit):
                         continue
                     record = {"function": func.name, "address": hex(func.start)}
                     try:
-                        n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(func, bv)
+                        (
+                            n_instr, n_native, ir_ops_counts, ir_ast_counts, native_counts,
+                            n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, n_ssa_instr,
+                            op_histogram, text, n_cfg_blocks, n_cfg_edges,
+                        ) = lift_function(func, bv)
                         record["status"] = "ok"
                         record["num_hlil_instructions"] = n_instr
                         record["num_native_instructions"] = n_native
+                        record["num_temp_vars"] = n_temp_vars
+                        record["num_escape_ops"] = n_escape_ops
+                        record["max_nesting_depth"] = max_nesting_depth
+                        record["sum_nesting_depth"] = sum_nesting_depth
+                        record["num_ssa_instructions"] = n_ssa_instr
+                        record["num_cfg_blocks"] = n_cfg_blocks
+                        record["num_cfg_edges"] = n_cfg_edges
+                        record["op_histogram"] = dict(op_histogram)
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                             record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

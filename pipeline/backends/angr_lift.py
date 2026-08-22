@@ -12,6 +12,7 @@ python3 -m pipeline.backends.angr_lift \
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -125,6 +126,51 @@ def classify_vex_statement_ast(stmt):
     return labels
 
 
+def _vex_op_name(expr):
+    """VEX IRExpr -> op-identity string: the specific IROp (e.g. "Iop_Add32")
+    for Binop/Unop/Triop/Qop nodes, since that's the actual operation being
+    performed, not just its arity shape; the plain tag (e.g. "Iex_Load",
+    "Iex_Const", "Iex_RdTmp") for everything else, where the tag alone
+    already names the operation.
+    """
+    if expr.tag in ("Iex_Binop", "Iex_Unop", "Iex_Triop", "Iex_Qop"):
+        return expr.op
+    return expr.tag
+
+
+def vex_statement_op_histogram(stmt):
+    """{op_name: count} over stmt's own node (by VEX statement tag) and
+    every nested sub-expression in its tree (via IRExpr.child_expressions,
+    already fully recursive -- see classify_vex_statement_ast's own use of
+    it). Used by the agnosticism metrics' weighted_jaccard (see
+    pipeline/metrics/blocks/agnosticism.py) to compare op-frequency
+    distributions across architecture builds of the same binary.
+    """
+    counts = Counter()
+    counts[stmt.tag] += 1
+    for expr in stmt.child_expressions:
+        counts[_vex_op_name(expr)] += 1
+    return counts
+
+
+def vex_node_depth(node):
+    """How many levels deep node's own expression tree nests -- 1 for a
+    leaf/flat node with no nested IRExpr-valued slot, +1 for each level of
+    embedded sub-expression (e.g. "t5 = Add32(t1,t2)" is depth 2: the WrTmp
+    statement's own node, plus the Add32 nested inside it).
+    """
+    max_child_depth = 0
+    for slot in node.__slots__:
+        value = getattr(node, slot)
+        if isinstance(value, pyvex.expr.IRExpr):
+            max_child_depth = max(max_child_depth, vex_node_depth(value))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, pyvex.expr.IRExpr):
+                    max_child_depth = max(max_child_depth, vex_node_depth(item))
+    return 1 + max_child_depth
+
+
 def list_functions(cfg):
     functions = []
     for func in cfg.kb.functions.values():
@@ -141,21 +187,60 @@ def list_functions(cfg):
 
 
 def lift_function(proj, func, cs_arch, family):
+    # Cyclomatic-complexity metric: func.graph is angr's own local transition
+    # graph for this function (block-level nodes, transition/exception/
+    # fake_return edges only -- calls to *other* functions are excluded, and
+    # a call's fallthrough is represented as a fake_return edge back into
+    # this same graph), already cached from CFGFast -- verified live against
+    # this project's own x86/32 `ls` corpus (main: 131 nodes/175 edges ->
+    # M=46, a plausible complexity for a large branchy function). See
+    # pipeline/metrics/blocks/agnosticism.py's cyclomatic_complexity_delta.
+    cfg_graph = func.graph
+    num_cfg_blocks = cfg_graph.number_of_nodes()
+    num_cfg_edges = cfg_graph.number_of_edges()
+
     lines = [f"; ---- function {func.name} @ {hex(func.addr)} ----"]
     total_statements = 0
     total_native_instructions = 0
+    total_vex_temps = 0
+    num_escape_ops = 0
+    max_nesting_depth = 0
+    sum_nesting_depth = 0
     ir_ops_counts = {c: 0 for c in CATEGORIES}
     ir_ast_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard.
+    op_histogram = Counter()
     for block in func.blocks:
         data = proj.loader.memory.load(block.addr, block.size)
         irsb = pyvex.lift(data, block.addr, proj.arch)
+        # Temporaries metric: pyvex's own per-IRSB temp count. IRTemp
+        # numbering (t0, t1, ...) is local to each basic block, not global to
+        # the function, so this is summed across blocks rather than deduped
+        # into one set
+        total_vex_temps += len(irsb.tyenv.types)
         lines.append(f"; ---- block 0x{block.addr:x} (size={block.size}) ----")
         for stmt in irsb.statements:
             lines.append(f"  {stmt}")
             ir_ops_counts[classify_vex_statement_ops(stmt)] += 1
             for label in classify_vex_statement_ast(stmt):
                 ir_ast_counts[label] += 1
+            op_histogram.update(vex_statement_op_histogram(stmt))
+            # Escape-valve metric: Ist_Dirty is VEX's own generic fallback for
+            # instructions libVEX can't express as primitive IR and instead
+            # models as an opaque call to a "dirty helper" C function (e.g.
+            # x86 CPUID/string ops, ARM NEON)
+            if stmt.tag == "Ist_Dirty":
+                num_escape_ops += 1
+            # Nesting-depth metric: how deep this one statement's own
+            # expression tree goes, summed/maxed across the function so the
+            # metrics block can report both a typical (mean) and worst-case
+            # (max) depth per function.
+            depth = vex_node_depth(stmt)
+            max_nesting_depth = max(max_nesting_depth, depth)
+            sum_nesting_depth += depth
         lines.append(f"  NEXT: {irsb.next} ; jumpkind={irsb.jumpkind}")
         lines.append("")
         total_statements += len(irsb.statements)
@@ -170,8 +255,15 @@ def lift_function(proj, func, cs_arch, family):
         # way as any other statement's expression tree.
         ir_ops_counts["control"] += 1
         ir_ast_counts["control"] += 1
+        # The terminator's own op-identity is its jumpkind (Ijk_Call,
+        # Ijk_Ret, Ijk_Boring, ...) -- a real, architecture-independent
+        # signal of what kind of control transfer this is, unlike
+        # irsb.next's own tag (Iex_Const/Iex_RdTmp), which only describes
+        # how the target address is computed.
+        op_histogram[irsb.jumpkind] += 1
         for expr in irsb.next.child_expressions:
             ir_ast_counts[_classify_vex_expr(expr)] += 1
+            op_histogram[_vex_op_name(expr)] += 1
 
         # block.instructions for expansion ratio
         total_native_instructions += block.instructions
@@ -180,7 +272,11 @@ def lift_function(proj, func, cs_arch, family):
                 native_counts[classify_insn(wrapped.insn, cs_arch, family)] += 1
 
     text = "\n".join(lines)
-    return total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts, text
+    return (
+        total_statements, total_native_instructions, ir_ops_counts, ir_ast_counts, native_counts,
+        total_vex_temps, num_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+        num_cfg_blocks, num_cfg_edges,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -220,12 +316,21 @@ def run(binary_path, outdir, limit):
                     continue
 
                 try:
-                    n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts, text = lift_function(
-                        proj, func, cs_arch, family
-                    )
+                    (
+                        n_stmts, n_native, ir_ops_counts, ir_ast_counts, native_counts,
+                        n_temp_vars, n_escape_ops, max_nesting_depth, sum_nesting_depth, op_histogram, text,
+                        n_cfg_blocks, n_cfg_edges,
+                    ) = lift_function(proj, func, cs_arch, family)
                     record["status"] = "ok"
                     record["num_statements"] = n_stmts
                     record["num_native_instructions"] = n_native
+                    record["num_temp_vars"] = n_temp_vars
+                    record["num_escape_ops"] = n_escape_ops
+                    record["max_nesting_depth"] = max_nesting_depth
+                    record["sum_nesting_depth"] = sum_nesting_depth
+                    record["num_cfg_blocks"] = n_cfg_blocks
+                    record["num_cfg_edges"] = n_cfg_edges
+                    record["op_histogram"] = dict(op_histogram)
                     for cat in CATEGORIES:
                         record[f"ir_ops_{cat}"] = ir_ops_counts[cat]
                         record[f"ir_ast_{cat}"] = ir_ast_counts[cat]

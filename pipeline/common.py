@@ -133,7 +133,15 @@ def write_whole_binary_dump(outdir, filename, chunks):
     """
     ordered = sorted(chunks, key=lambda c: c[0])
     path = Path(outdir) / filename
-    path.write_text("\n".join(text for _, text in ordered))
+    # Written as many small write() calls rather than one path.write_text()
+    # with the whole joined string to avoid writting errors
+    with path.open("w") as f:
+        first = True
+        for _, text in ordered:
+            if not first:
+                f.write("\n")
+            f.write(text)
+            first = False
     return path
 
 

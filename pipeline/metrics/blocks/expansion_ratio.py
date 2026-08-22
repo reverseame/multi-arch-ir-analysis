@@ -1,4 +1,4 @@
-"""Verbosity metrics block: IR-size expansion ratio, per (binary, backend,
+"""Expansion ratio metrics block: IR-size expansion ratio, per (binary, backend,
 function), from possible_metrics.txt's "IR-size expansion ratio". Reports
 two independent axes side by side:
 
@@ -21,39 +21,45 @@ Both sides of the ratio are classified by the same rule for a given category
 (see pipeline/native_classify.py for the native side; each backend module's
 own IR-op classifier for the numerator -- angr_lift.classify_vex_statement_
 {ops,ast}, binja_il_classify.classify_il_function_{ops,ast}, pyghidra_lift.
-classify_pcode_op, r2_lift.classify_esil_expression, and this module's
-classify_ll_line for retdec's LLVM IR). "other" (data movement, casts, SSA
-bookkeeping, NOPs) is computed too and counted into the *_ops/*_ast totals,
-but not reported as its own ratio -- see each classifier's own docstring for
-why it's excluded from the category breakdown (mainly: type conversions/
-reinterprets are deliberately not counted as "arithmetic" everywhere,
-consistently).
+classify_pcode_op, r2_lift.classify_esil_expression, ida_lift's mcode
+category table (walked flat for ops via lift_function, recursively for ast
+via _walk_minsn_ast), and this module's classify_ll_line for retdec's LLVM
+IR). "other" (data movement, casts, SSA bookkeeping, NOPs) is computed too
+and counted into the *_ops/*_ast totals, but not reported as its own ratio
+-- see each classifier's own docstring for why it's excluded from the
+category breakdown (mainly: type conversions/reinterprets are deliberately
+not counted as "arithmetic" everywhere, consistently).
 
-The ops/ast distinction only actually differs for VEX (angr) and Binary
-Ninja's LLIL/MLIL/HLIL -- the two backends whose IR can nest sub-expressions
-inside a single instruction/statement (angr_lift.classify_vex_statement_ast
-walks every statement's full expression tree via pyvex's already-recursive
-IRExpr.child_expressions; binja_il_classify.classify_il_function_ast walks
-every instruction and sub-expression via il_func.traverse()) -- e.g.
-`t5 = Add32(Mul32(t1,t2), t3)` counts as one "arithmetic" node at the ops
-granularity (the whole statement) but two at the ast granularity (the Add
-and the Mul). pyghidra (P-code), r2 (ESIL), and retdec (LLVM IR text) are
-already atomic/flat at the operation level -- their ops and ast numbers are
-identical by construction (same underlying count, reported under both
-names) since there's no nesting to distinguish.
+The ops/ast distinction only actually differs for VEX (angr), Binary
+Ninja's LLIL/MLIL/HLIL, and IDA's Hex-Rays microcode -- the backends whose
+IR can nest sub-expressions inside a single instruction/statement
+(angr_lift.classify_vex_statement_ast walks every statement's full
+expression tree via pyvex's already-recursive IRExpr.child_expressions;
+binja_il_classify.classify_il_function_ast walks every instruction and
+sub-expression via il_func.traverse(); ida_lift._walk_minsn_ast walks every
+embedded sub-instruction reachable through a minsn_t's mop_d/mop_f/mop_a/
+mop_p operands) -- e.g. `t5 = Add32(Mul32(t1,t2), t3)` counts as one
+"arithmetic" node at the ops granularity (the whole statement) but two at
+the ast granularity (the Add and the Mul); similarly Hex-Rays often prints
+`mov call $foo() => result, ret` as one microcode instruction but that's an
+outer mov wrapping a nested call, two ops at the ast granularity. pyghidra
+(P-code), r2 (ESIL), and retdec (LLVM IR text) are already atomic/flat at
+the operation level -- their ops and ast numbers are identical by
+construction (same underlying count, reported under both names) since
+there's no nesting to distinguish.
 
 Per-function category counts come from two different places depending on
 the backend:
-  - angr/binja/pyghidra/r2 record them directly in lift_records.json (the
-    ir_ops_{category}/ir_ast_{category}/native_{category} fields each
+  - angr/binja/pyghidra/r2/ida record them directly in lift_records.json
+    (the ir_ops_{category}/ir_ast_{category}/native_{category} fields each
     backend's lift_function now produces -- pyghidra/r2 only produce
     ir_ops_{category}, since ops==ast for them; see _record_category_counts'
     fallback), because computing the native side needs their own
     already-open session (loaded VEX blocks, an open Binary Ninja database,
-    an open Ghidra program, a live r2 session) -- getting it later here
-    would mean reloading the whole binary in that tool, far more expensive
-    than the near-free count taken while the session is already open for
-    lifting.
+    an open Ghidra program, a live r2 session, an open IDA database) --
+    getting it later here would mean reloading the whole binary in that
+    tool, far more expensive than the near-free count taken while the
+    session is already open for lifting.
   - retdec's are computed here instead, straight from the .dsm disassembly
     listing and .ll LLVM IR module retdec_lift.py already leaves on disk
     under the run's outdir (see _retdec_native_category_counts and
@@ -89,7 +95,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from pipeline.backends.retdec_lift import DSM_FUNCTION_RE, LL_DEFINE_RE
-from pipeline.metrics.formulas import aggregate_stats, expansion_ratio
+from pipeline.metrics.formulas import aggregate_stats, aggregate_stats_with_iqr, expansion_ratio
 from pipeline.metrics.registry import register_block
 from pipeline.native_classify import arch_family, classify_bytes, make_disassembler
 
@@ -110,6 +116,7 @@ IR_SIZE_FIELDS = {
     "pyghidra": "num_pcode_ops",
     "retdec": "num_ll_lines",
     "r2": "num_esil_ops",
+    "ida": "num_microcode_ops",
 }
 
 DSM_INSTRUCTION_RE = re.compile(r"^0x(?P<addr>[0-9a-fA-F]+):\s+(?P<bytes>[0-9a-fA-F ]+?)\s*\t")
@@ -154,24 +161,37 @@ _LL_ARITHMETIC = {
 _LL_CALL_MARKERS = {"tail", "musttail", "notail"}
 
 
-def classify_ll_line(line):
-    """One line of RetDec's LLVM-IR text output -> "arithmetic"/"control"/
-    "memory"/"other". Handles both instruction forms LLVM IR text uses:
-    "%N = OPCODE ..." (value-producing) and a bare "OPCODE ..." (void, e.g.
-    store/br/ret) -- labels, comments, blank lines, and directives
-    (uselistorder, metadata) don't start with any recognized opcode token
-    and fall to "other" with no special-casing needed.
+def _ll_line_opcode(line):
+    """Extract the raw LLVM-IR opcode token from one line of RetDec's .ll
+    text output (e.g. "add", "br", "call"), or None for lines with no
+    opcode -- labels, comments, blank lines, and directives (uselistorder,
+    metadata) don't start with any recognized opcode token. Handles both
+    instruction forms LLVM IR text uses: "%N = OPCODE ..." (value-producing)
+    and a bare "OPCODE ..." (void, e.g. store/br/ret). Shared by
+    classify_ll_line (category classification) and
+    pipeline/metrics/blocks/agnosticism.py's op-frequency histogram (raw
+    opcode identity).
     """
     stripped = line.strip()
     if not stripped:
-        return "other"
+        return None
     rhs = stripped.split("=", 1)[1].strip() if "=" in stripped else stripped
     tokens = rhs.split()
     if not tokens:
-        return "other"
+        return None
     opcode = tokens[0]
     if opcode in _LL_CALL_MARKERS and len(tokens) > 1:
         opcode = tokens[1]
+    return opcode
+
+
+def classify_ll_line(line):
+    """One line of RetDec's LLVM-IR text output -> "arithmetic"/"control"/
+    "memory"/"other", via _ll_line_opcode.
+    """
+    opcode = _ll_line_opcode(line)
+    if opcode is None:
+        return "other"
     if opcode in _LL_CONTROL:
         return "control"
     if opcode in _LL_MEMORY:
@@ -179,6 +199,35 @@ def classify_ll_line(line):
     if opcode in _LL_ARITHMETIC:
         return "arithmetic"
     return "other"
+
+
+def _iter_ll_functions(lines):
+    """Yield (name, function_lines) for every top-level `define` block in a
+    .ll module's lines, using brace-depth tracking (RetDec doesn't nest
+    functions, but a naive line-range split without brace tracking would
+    break on functions containing nested `{`/`}` in literals) -- the same
+    walk retdec_lift.py's own split_ll_by_function uses. Shared by
+    _retdec_ir_category_counts and pipeline/metrics/blocks/agnosticism.py's
+    op-frequency histogram, both of which need the same per-function line
+    range but classify its contents differently.
+    """
+    i = 0
+    while i < len(lines):
+        match = LL_DEFINE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        name = match["name"]
+        start = i
+        depth = 0
+        j = i
+        while j < len(lines):
+            depth += lines[j].count("{") - lines[j].count("}")
+            j += 1
+            if depth == 0 and j > start:
+                break
+        yield name, lines[start:j]
+        i = j
 
 
 def _load_lift_records(outdir):
@@ -262,27 +311,11 @@ def _retdec_ir_category_counts(outdir, binary_path):
         return {}
     lines = ll_path.read_text(errors="replace").splitlines()
     counts = {}
-
-    i = 0
-    while i < len(lines):
-        match = LL_DEFINE_RE.match(lines[i])
-        if not match:
-            i += 1
-            continue
-        name = match["name"]
-        start = i
-        depth = 0
-        j = i
-        while j < len(lines):
-            depth += lines[j].count("{") - lines[j].count("}")
-            j += 1
-            if depth == 0 and j > start:
-                break
+    for name, func_lines in _iter_ll_functions(lines):
         func_counts = _empty_counts()
-        for line in lines[start:j]:
+        for line in func_lines:
             func_counts[classify_ll_line(line)] += 1
         counts[name] = func_counts
-        i = j
     return counts
 
 
@@ -291,11 +324,11 @@ def _record_category_counts(record):
     lift_records.json entry, from the ir_ops_{category}/ir_ast_{category}/
     native_{category} fields each backend's lift_function now produces.
 
-    Only angr and the three Binary Ninja backends produce ir_ast_{category}
-    (their IR can nest sub-expressions -- see module docstring); pyghidra
-    and r2 only produce ir_ops_{category}, so ast_counts falls back to the
-    same ops values for them (ops and ast are identical by construction
-    there, no nesting to distinguish).
+    Only angr, the three Binary Ninja backends, and ida produce
+    ir_ast_{category} (their IR can nest sub-expressions -- see module
+    docstring); pyghidra and r2 only produce ir_ops_{category}, so
+    ast_counts falls back to the same ops values for them (ops and ast are
+    identical by construction there, no nesting to distinguish).
     """
     ops_counts = {c: record.get(f"ir_ops_{c}") for c in CATEGORIES}
     ast_counts = {c: record.get(f"ir_ast_{c}", record.get(f"ir_ops_{c}")) for c in CATEGORIES}
@@ -313,18 +346,21 @@ def _total(counts):
     return sum(values)
 
 
-@register_block("verbosity")
+@register_block("expansion_ratio")
 def compute(runs, results_dir):
     completed = [r for r in runs if r.get("status") == "ok" and r["backend"] in IR_SIZE_FIELDS]
 
     overall = {key: [] for key in RATIO_KEYS}
     by_backend = defaultdict(lambda: {key: [] for key in RATIO_KEYS})
+    by_backend_arch = defaultdict(lambda: defaultdict(lambda: {key: [] for key in RATIO_KEYS}))
     rows = []
 
     for run in completed:
         backend = run["backend"]
         ir_field = IR_SIZE_FIELDS[backend]
         meta = run.get("binary_meta") or {}
+        arch, bits = meta.get("arch"), meta.get("bits")
+        arch_bits = f"{arch}_{bits}" if arch is not None and bits is not None else None
 
         retdec_ir_counts = retdec_native_counts = None
         if backend == "retdec":
@@ -379,6 +415,8 @@ def compute(runs, results_dir):
                     any_ratio = True
                     overall[gran].append(total_ratio)
                     by_backend[backend][gran].append(total_ratio)
+                    if arch_bits is not None:
+                        by_backend_arch[backend][arch_bits][gran].append(total_ratio)
 
                 for cat in RATIO_CATEGORIES:
                     ratio = expansion_ratio(counts.get(cat), native_counts.get(cat))
@@ -389,6 +427,8 @@ def compute(runs, results_dir):
                         key = f"{gran}_{cat}"
                         overall[key].append(ratio)
                         by_backend[backend][key].append(ratio)
+                        if arch_bits is not None:
+                            by_backend_arch[backend][arch_bits][key].append(ratio)
 
             for cat in CATEGORIES:
                 row[f"native_{cat}"] = native_counts.get(cat)
@@ -398,7 +438,7 @@ def compute(runs, results_dir):
             rows.append(row)
 
     return {
-        "block": "verbosity",
+        "block": "expansion_ratio",
         "num_runs_ok": len(completed),
         "num_runs_total": len(runs),
         "num_functions_evaluated": len(rows),
@@ -407,7 +447,16 @@ def compute(runs, results_dir):
             for key in RATIO_KEYS
         },
         "by_backend": {
-            backend: {f"expansion_ratio_{key}": aggregate_stats(vals[key]) for key in RATIO_KEYS}
+            backend: {
+                **{f"expansion_ratio_{key}": aggregate_stats(vals[key]) for key in RATIO_KEYS},
+                "by_arch": {
+                    arch_bits: {
+                        f"expansion_ratio_{key}": aggregate_stats_with_iqr(arch_vals[key])
+                        for key in RATIO_KEYS
+                    }
+                    for arch_bits, arch_vals in by_backend_arch.get(backend, {}).items()
+                },
+            }
             for backend, vals in by_backend.items()
         },
         "rows": rows,

@@ -9,6 +9,7 @@ python3 -m pipeline.backends.r2_lift \
 
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -159,6 +160,62 @@ def classify_esil_expression(esil, esil_operators, pc_register=None):
     return counts
 
 
+def esil_op_histogram(esil, esil_operators):
+    """{operator_token: count} (e.g. "+" -> 3, "=[4]" -> 1) of real ESIL
+    *operator* tokens in one instruction's ESIL expression -- same
+    operator/operand split as classify_esil_expression, but keyed by the raw
+    token instead of collapsed into arithmetic/control/memory/other. Used by
+    the agnosticism metrics' weighted_jaccard (see
+    pipeline/metrics/blocks/agnosticism.py) to compare op-frequency
+    distributions across architecture builds.
+    """
+    counts = Counter()
+    if not esil:
+        return counts
+    for tok in esil.split(","):
+        if tok in esil_operators or tok in _ESIL_FORCE_CONTROL:
+            counts[tok] += 1
+    return counts
+
+
+# r2's own sentinel for "no separate default target" on a switch_op (an
+# unsigned 64-bit -1) -- distinct from a real default target address.
+_R2_NO_DEFAULT = 18446744073709551615
+
+
+def esil_block_cfg_counts(r2, addr):
+    """(num_blocks, num_edges) over the function's own basic-block-level CFG
+    at `addr`, from radare2's `afbj` (function basic blocks). Verified live
+    against this project's own x86/32 `ls` corpus, including a switch-heavy
+    function (dbg.quotearg_buffer_restyled).
+
+    Each block's "jump"/"fail" keys (if present) are its real successor
+    edges -- "jump" is the unconditional or true-branch target, "fail" is
+    the conditional-false/fallthrough target; a terminal block (e.g. ending
+    in `ret`) has neither. A block ending in a switch reports neither key at
+    all, using "switch_op" instead: one edge per entry in switch_op["cases"]
+    (even when several cases share the same jump target -- each case is
+    still its own distinct control-flow edge, same convention a real switch
+    statement's own case labels get), plus one more for switch_op["def_val"]
+    (the default-case target) unless it equals _R2_NO_DEFAULT, meaning this
+    switch has no separate default branch to count.
+    """
+    blocks = r2.cmdj(f"afbj @ {addr}") or []
+    num_edges = 0
+    for block in blocks:
+        switch_op = block.get("switch_op")
+        if switch_op is not None:
+            num_edges += len(switch_op.get("cases", []))
+            if switch_op.get("def_val") != _R2_NO_DEFAULT:
+                num_edges += 1
+            continue
+        if "jump" in block:
+            num_edges += 1
+        if "fail" in block:
+            num_edges += 1
+    return len(blocks), num_edges
+
+
 def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
     data = r2.cmdj(f"pdfj @ {addr}")
     if not data or "ops" not in data:
@@ -169,6 +226,10 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
     num_uncovered = 0
     ir_counts = {c: 0 for c in CATEGORIES}
     native_counts = {c: 0 for c in CATEGORIES}
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard.
+    op_histogram = Counter()
     for op in ops:
         op_addr = op.get("offset", op.get("addr", addr))
         mnem = op.get("opcode", "")
@@ -178,6 +239,7 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
         op_counts = classify_esil_expression(esil, esil_operators, pc_register)
         for cat in CATEGORIES:
             ir_counts[cat] += op_counts[cat]
+        op_histogram.update(esil_op_histogram(esil, esil_operators))
         if md is not None and op.get("bytes"):
             decoded = next(classify_bytes(md, bytes.fromhex(op["bytes"]), op_addr, family), None)
             if decoded is not None:
@@ -187,8 +249,22 @@ def lift_function(r2, addr, func_name, esil_operators, md, family, pc_register):
         lines.append("")
 
     num_esil_ops = sum(ir_counts.values())
+    # Cyclomatic-complexity metric: see esil_block_cfg_counts /
+    # pipeline/metrics/blocks/agnosticism.py's cyclomatic_complexity_delta.
+    num_cfg_blocks, num_cfg_edges = esil_block_cfg_counts(r2, addr)
     text = "\n".join(lines)
-    return len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, text
+    # Temporaries metric: always 0 by design -- ESIL is a stack-based
+    # representation (an RPN expression per instruction) with no operator
+    # that declares a named temporary, confirmed against radare2's own
+    # `ae???` operator table (every operator is a stack math/compare/memory/
+    # control op, none of them a temp declaration). A meaningful data point
+    # in its own right (ESIL genuinely has no notion of a named temporary),
+    # not a measurement gap -- see pipeline/metrics/blocks/temporaries.py.
+    num_temp_vars = 0
+    return (
+        len(ops), num_esil_ops, num_uncovered, ir_counts, native_counts, num_temp_vars,
+        op_histogram, text, num_cfg_blocks, num_cfg_edges,
+    )
 
 
 def run(binary_path, outdir, limit):
@@ -235,13 +311,20 @@ def run(binary_path, outdir, limit):
                     record = {"function": func["name"], "address": func["address"]}
                     try:
                         md = disassembler_for(func.get("bits"))
-                        n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, text = lift_function(
+                        (
+                            n_native, n_esil_ops, n_uncovered, ir_counts, native_counts, n_temp_vars,
+                            op_histogram, text, n_cfg_blocks, n_cfg_edges,
+                        ) = lift_function(
                             r2, addr, func["name"], esil_operators, md, family, pc_register
                         )
                         record["status"] = "ok"
                         record["num_native_instructions"] = n_native
                         record["num_esil_ops"] = n_esil_ops
                         record["num_uncovered"] = n_uncovered
+                        record["num_temp_vars"] = n_temp_vars
+                        record["num_cfg_blocks"] = n_cfg_blocks
+                        record["num_cfg_edges"] = n_cfg_edges
+                        record["op_histogram"] = dict(op_histogram)
                         for cat in CATEGORIES:
                             record[f"ir_ops_{cat}"] = ir_counts[cat]
                             record[f"native_{cat}"] = native_counts[cat]

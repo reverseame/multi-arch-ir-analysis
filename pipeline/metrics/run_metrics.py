@@ -1,7 +1,7 @@
 """Orchestrator for phase 2 of the pipeline: metrics processing over the
 results/ directory produced by pipeline.run_lifting.
 
-Each metrics category (cost, verbosity, robustness, agnosticism, ...) is a
+Each metrics category (cost, expansion_ratio, robustness, agnosticism, ...) is a
 self-contained block under pipeline/metrics/blocks/ that registers itself
 with @register_block. This script only loads manifest.json plus each run's
 binary metadata, then hands the run list to whichever blocks were requested --
@@ -62,7 +62,14 @@ def write_block_output(outdir, name, summary):
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            f.flush()
+            # Flushed one row at a time (rather than writerows' single bulk
+            # write) to avoid the same OSError as write_whole_binary_dump --
+            # shared-folder mounts (vboxsf) corrupt the raw write() return
+            # value once the buffered payload gets large enough.
+            for row in rows:
+                writer.writerow(row)
+                f.flush()
     return csv_path
 
 

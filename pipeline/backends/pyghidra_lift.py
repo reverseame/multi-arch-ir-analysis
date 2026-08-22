@@ -17,6 +17,7 @@ way) before the JVM starts.
 
 import sys
 import traceback
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -174,10 +175,29 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
     if high_func is None:
         raise RuntimeError("decompiler produced no HighFunction")
 
+    # Cyclomatic-complexity metric: HighFunction.getBasicBlocks() (inherited
+    # from PcodeSyntaxTree) gives the high-P-code-level basic blocks --
+    # PcodeBlockBasic.getOutSize() is each block's own real successor-edge
+    # count (verified via the SoftwareModeling.jar class files in this
+    # Ghidra install: PcodeBlock.getOutSize()/getOutSize() are the base
+    # class's own edge accessors). Used by pipeline/metrics/blocks/
+    # agnosticism.py's cyclomatic_complexity_delta via M = E - N + 2.
+    cfg_blocks = high_func.getBasicBlocks()
+    num_cfg_blocks = len(cfg_blocks)
+    num_cfg_edges = sum(block.getOutSize() for block in cfg_blocks)
+
     lines = [f"; ---- function {func.getName()} @ {func.getEntryPoint()} ----"]
     total_ops = 0
     current_addr = None
     ir_counts = {c: 0 for c in CATEGORIES}
+    num_temp_vars = 0
+    num_escape_ops = 0
+    # Agnosticism metric: op-type frequency histogram, compared across
+    # architecture builds of the same binary by pipeline/metrics/blocks/
+    # agnosticism.py's weighted_jaccard. High P-code ops are already flat
+    # (no nested-expression model, see nesting_depth.py's module docstring),
+    # so one mnemonic per op, no traversal beyond this existing loop needed.
+    op_histogram = Counter()
     op_iter = high_func.getPcodeOps()
     while op_iter.hasNext():
         op = op_iter.next()
@@ -187,7 +207,24 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
             current_addr = addr
         lines.append(f"  {pcodeop_high_str(op, language)}")
         total_ops += 1
-        ir_counts[classify_pcode_op(op.getMnemonic())] += 1
+        mnemonic = op.getMnemonic()
+        ir_counts[classify_pcode_op(mnemonic)] += 1
+        op_histogram[mnemonic] += 1
+        # Escape-valve metric: CALLOTHER is P-code's own generic fallback for
+        # semantics it can't express as a primitive op (e.g. x86 CPUID/RDTSC,
+        # architecture-specific intrinsics)
+        if mnemonic == "CALLOTHER":
+            num_escape_ops += 1
+        # Temporaries metric: count at *definition* time rather than
+        # deduping by the unique-space varnode's raw offset -- that offset
+        # is reused across many genuinely distinct temporaries within the
+        # same function, so a set() keyed by offset would drastically
+        # undercount. Ghidra's SSA property guarantees each unique-space
+        # value has exactly one defining PcodeOp, so counting definitions is
+        # both simpler and exact.
+        out = op.getOutput()
+        if out is not None and out.isUnique():
+            num_temp_vars += 1
 
     # Native disassembly instruction count over the function's own address
     # range for obtaining expansion ratio.
@@ -202,7 +239,10 @@ def lift_function(ifc, func, language, monitor, timeout_s, listing, md, family):
                 native_counts[decoded[3]] += 1
 
     text = "\n".join(lines)
-    return total_ops, num_native_instructions, ir_counts, native_counts, text
+    return (
+        total_ops, num_native_instructions, ir_counts, native_counts, num_temp_vars, num_escape_ops,
+        op_histogram, text, num_cfg_blocks, num_cfg_edges,
+    )
 
 
 def run(binary_path, outdir, limit, decomp_timeout_s):
@@ -274,12 +314,20 @@ def run(binary_path, outdir, limit, decomp_timeout_s):
                                 continue
 
                             try:
-                                n_ops, n_native, ir_counts, native_counts, text = lift_function(
+                                (
+                                    n_ops, n_native, ir_counts, native_counts, n_temp_vars, n_escape_ops,
+                                    op_histogram, text, n_cfg_blocks, n_cfg_edges,
+                                ) = lift_function(
                                     ifc, func, language, monitor, decomp_timeout_s, listing, md, family
                                 )
                                 record["status"] = "ok"
                                 record["num_pcode_ops"] = n_ops
                                 record["num_native_instructions"] = n_native
+                                record["num_temp_vars"] = n_temp_vars
+                                record["num_escape_ops"] = n_escape_ops
+                                record["num_cfg_blocks"] = n_cfg_blocks
+                                record["num_cfg_edges"] = n_cfg_edges
+                                record["op_histogram"] = dict(op_histogram)
                                 for cat in CATEGORIES:
                                     record[f"ir_ops_{cat}"] = ir_counts[cat]
                                     record[f"native_{cat}"] = native_counts[cat]

@@ -1,0 +1,12 @@
+.git/
+IRanalysis/
+old_poc/
+pipeline/
+README.md
+__pycache__/
+*.pyc
+results/
+binaries/
+binaries.zip
+*.rep/
+*.gpr
